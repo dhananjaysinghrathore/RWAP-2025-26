@@ -1,4 +1,4 @@
-# streamlit_app.py — RWAP (Bn/Mn KPIs, Map above charts, selectable map colors)
+# streamlit_app.py — RWAP (friendlier clusters, Bn/Mn KPIs, map above charts, color-by)
 import os
 from pathlib import Path
 import numpy as np
@@ -87,7 +87,7 @@ def canonicalize(df: pd.DataFrame) -> pd.DataFrame:
         if hit is not None:
             out[k] = df[hit]
 
-    for n in ["lat", "lon", "sqft", "value", "age"]:
+    for n in ["lat","lon","sqft","value","age"]:
         if n in out.columns:
             out[n] = pd.to_numeric(out[n], errors="coerce")
 
@@ -102,17 +102,17 @@ def canonicalize(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def fmt_money_units(x: float) -> str:
-    """Format as $X.XX Bn / Mn (else plain $ with separators)."""
+    """Format as $X.XX Bn / Mn (else plain $)."""
     try:
         x = float(x)
     except Exception:
         return "—"
     if np.isnan(x):
         return "—"
-    absx = abs(x)
-    if absx >= 1e9:
+    a = abs(x)
+    if a >= 1e9:
         return f"${x/1e9:,.2f} Bn"
-    if absx >= 1e6:
+    if a >= 1e6:
         return f"${x/1e6:,.2f} Mn"
     return f"${x:,.0f}"
 
@@ -129,7 +129,63 @@ def color_map_for(series: pd.Series):
     colors = series.fillna("Unknown").astype(str).map(cmap).tolist()
     return colors, cmap
 
+def assign_cluster_names_from_profile(df_in: pd.DataFrame, cluster_col: str = "cluster") -> pd.DataFrame:
+    """
+    If a numeric cluster column exists, create a human-readable Cluster Name:
+    - "Tiny/Special (High $/ft²)"  -> highest median value_psf
+    - "Large & Older"              -> highest median sqft (and typically older)
+    - "Core Buildings"             -> remaining (largest typical cohort)
+    For k != 3, names remaining clusters as "Cluster N".
+    """
+    df = df_in.copy()
+    if cluster_col not in df.columns:
+        return df
+    # numeric coercion for safety
+    try:
+        df[cluster_col] = pd.to_numeric(df[cluster_col], errors="coerce")
+    except Exception:
+        return df
+
+    labels = sorted(df[cluster_col].dropna().unique().tolist())
+    if not labels:
+        return df
+
+    profile_cols = [c for c in ["value_psf","sqft","age"] if c in df.columns]
+    if not profile_cols:
+        df["Cluster Name"] = df[cluster_col].apply(lambda x: f"Cluster {int(x)}" if pd.notna(x) else "Unknown")
+        return df
+
+    prof = df.groupby(cluster_col)[profile_cols].median()
+
+    name_map = {}
+    if len(labels) >= 3 and "value_psf" in prof.columns and "sqft" in prof.columns:
+        # choose special / large / core
+        small_high = prof["value_psf"].idxmax()
+        large_lab  = prof["sqft"].idxmax()
+        remaining = [l for l in labels if l not in [small_high, large_lab]]
+        core_lab = remaining[0] if remaining else None
+
+        name_map[small_high] = "Tiny/Special (High $/ft²)"
+        name_map[large_lab]  = "Large & Older"
+        if core_lab is not None:
+            name_map[core_lab] = "Core Buildings"
+
+        # Any extras get generic names
+        for l in labels:
+            if l not in name_map:
+                name_map[l] = f"Cluster {int(l)}"
+    else:
+        # Generic fallback
+        for l in labels:
+            name_map[l] = f"Cluster {int(l)}"
+
+    df["Cluster Name"] = df[cluster_col].map(name_map)
+    return df
+
 df = canonicalize(raw)
+# If dataset already has a 'cluster' column, add friendly names now for Dashboard color-by
+if "cluster" in df.columns:
+    df = assign_cluster_names_from_profile(df, "cluster")
 
 # Tabs
 tab_dash, tab_ml = st.tabs(["📊 Task 2: Dashboard", "🤖 Task 3: ML"])
@@ -138,16 +194,14 @@ tab_dash, tab_ml = st.tabs(["📊 Task 2: Dashboard", "🤖 Task 3: ML"])
 # ================= TAB 1 – DASHBOARD =================
 # =====================================================
 with tab_dash:
-    # Source hint
     found_path = next((p for p in CANDIDATE_FILES if p.exists()), None)
     st.caption(
         f"Loaded **{len(df):,}** rows from "
         f"{found_path.as_posix() if found_path else 'DATA_URL'}"
     )
 
-    # ---------- Filters with Reset ----------
+    # ---------- Filters + Reset ----------
     st.subheader("Filters")
-
     default_states = sorted(df["state"].dropna().unique().tolist()) if "state" in df.columns else []
     default_types  = sorted(df["asset_type"].dropna().unique().tolist()) if "asset_type" in df.columns else []
     default_confs  = sorted(df["conf_cat"].dropna().unique().tolist()) if "conf_cat" in df.columns else []
@@ -170,7 +224,6 @@ with tab_dash:
     sel_confs  = c3.multiselect("Confidence", default_confs,  default=st.session_state.sel_confs,  key="sel_confs")
     name_q     = c4.text_input("Search asset/ZIP contains", st.session_state.name_q, key="name_q")
 
-    # Sliders
     if "value" in df.columns and df["value"].notna().any():
         vmin, vmax = float(df["value"].min()), float(df["value"].max())
         v_range = st.slider("Value range", vmin, vmax, (vmin, vmax))
@@ -182,7 +235,6 @@ with tab_dash:
     else:
         s_range = None
 
-    # Apply filters
     flt = df.copy()
     if sel_states and "state" in flt.columns: flt = flt[flt["state"].isin(sel_states)]
     if sel_types  and "asset_type" in flt.columns: flt = flt[flt["asset_type"].isin(sel_types)]
@@ -191,12 +243,13 @@ with tab_dash:
         m = False
         if "asset_name" in flt.columns: m = flt["asset_name"].astype(str).str.contains(name_q, case=False, na=False)
         if "zip" in flt.columns:
-            m = (m | flt["zip"].astype(str).str.contains(name_q, na=False)) if isinstance(m, pd.Series) else flt["zip"].astype(str).str.contains(name_q, na=False)
+            m2 = flt["zip"].astype(str).str.contains(name_q, na=False)
+            m = (m | m2) if isinstance(m, pd.Series) else m2
         flt = flt[m]
     if v_range and "value" in flt.columns: flt = flt[(flt["value"] >= v_range[0]) & (flt["value"] <= v_range[1])]
     if s_range and "sqft" in flt.columns:  flt = flt[(flt["sqft"] >= s_range[0]) & (flt["sqft"] <= s_range[1])]
 
-    # ---------- KPIs (Bn/Mn formatting) ----------
+    # ---------- KPIs ----------
     st.markdown("### KPIs (Filtered)")
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Assets", f"{len(flt):,}")
@@ -204,7 +257,7 @@ with tab_dash:
     k3.metric("Median Value", fmt_money_units(flt['value'].median()) if "value" in flt.columns else "—")
     k4.metric("Median $/ft²", fmt_money_units(flt['value_psf'].median()) if "value_psf" in flt.columns else "—")
 
-    # ---------- MAP (placed ABOVE charts; color-by selector) ----------
+    # ---------- MAP (ABOVE charts) ----------
     st.markdown("### Map")
     if ("lat" not in flt.columns) or ("lon" not in flt.columns) or flt[["lat","lon"]].dropna().empty:
         st.info("No geocoded rows to plot. Check filters or CSV columns.")
@@ -214,7 +267,7 @@ with tab_dash:
         if geo.empty:
             st.warning("No rows with valid lat/lon after filters.")
         else:
-            # radius in METERS (visible at country zoom)
+            # radius (meters) visible at country zoom
             if "value" in geo.columns and geo["value"].notna().any():
                 v = geo["value"].astype(float).clip(lower=1)
                 vmed = max(float(v.median()), 1.0)
@@ -228,17 +281,24 @@ with tab_dash:
             if "conf_cat" in geo.columns:  color_options.append("Confidence")
             if "asset_type" in geo.columns: color_options.append("Asset Type")
             if "state" in geo.columns:      color_options.append("State")
-            if "cluster" in geo.columns:    color_options.append("Cluster")
-            color_by = st.selectbox("Color by", color_options or ["Confidence"], index=0)
+            if "Cluster Name" in geo.columns:
+                color_options.append("Cluster Name")
+            elif "cluster" in geo.columns:
+                color_options.append("Cluster (ID)")
 
+            color_by = st.selectbox("Color by", color_options or ["Confidence"], index=0)
             if color_by == "Confidence":
                 key_series = geo["conf_cat"]
             elif color_by == "Asset Type":
                 key_series = geo["asset_type"]
             elif color_by == "State":
                 key_series = geo["state"]
+            elif color_by == "Cluster Name":
+                key_series = geo["Cluster Name"]
+            elif color_by == "Cluster (ID)":
+                key_series = geo["cluster"].astype(str)
             else:
-                key_series = geo["cluster"] if "cluster" in geo.columns else geo["conf_cat"]
+                key_series = geo["conf_cat"] if "conf_cat" in geo.columns else pd.Series("All", index=geo.index)
 
             colors, cmap = color_map_for(key_series)
             geo["color"] = colors
@@ -248,7 +308,8 @@ with tab_dash:
                 [f"<span class='legend-item'><span class='legend-swatch' style='background: rgb({v[0]},{v[1]},{v[2]});'></span>{k}</span>"
                  for k, v in cmap.items()]
             )
-            st.markdown(f"**Legend:** {legend_html}", unsafe_allow_html=True)
+            if legend_html:
+                st.markdown(f"**Legend:** {legend_html}", unsafe_allow_html=True)
 
             center_lat = float(geo["lat"].mean()); center_lon = float(geo["lon"].mean())
             view = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=3.8 if len(geo)>1000 else 5)
@@ -267,8 +328,8 @@ with tab_dash:
                     "ScatterplotLayer",
                     data=geo,
                     get_position='[lon, lat]',
-                    get_radius='radius_m',          # meters
-                    radius_min_pixels=2,            # pixel floor so never invisible
+                    get_radius='radius_m',      # meters
+                    radius_min_pixels=2,        # pixel floor
                     radius_max_pixels=40,
                     get_fill_color='color',
                     pickable=True, auto_highlight=True,
@@ -321,7 +382,7 @@ with tab_dash:
 # =====================================================
 with tab_ml:
     st.subheader("Clustering (KMeans) + Classification (RandomForest)")
-    must = ["value", "sqft", "value_psf"]
+    must = ["value","sqft","value_psf"]
     if not all(c in df.columns for c in must):
         st.warning("CSV must include: value, sqft, value_psf (auto-generated if value & sqft exist).")
         st.stop()
@@ -345,25 +406,30 @@ with tab_ml:
     st.write(f"**Silhouette score:** {sil:.3f}")
 
     df_ml = df.copy()
-    df_ml["Asset Cluster"] = labels
+    df_ml["cluster"] = labels
 
-    sizes = pd.Series(labels).value_counts().sort_index().rename("count")
+    # Friendly names for ML output too
+    df_ml = assign_cluster_names_from_profile(df_ml, "cluster")
+
+    sizes = df_ml["cluster"].value_counts().sort_index().rename("count")
     st.write("**Cluster sizes**"); st.dataframe(sizes)
 
     prof_cols = [c for c in ["value","sqft","value_psf","age"] if c in df_ml.columns]
-    profile = df_ml.groupby("Asset Cluster")[prof_cols].median().sort_index()
+    profile = df_ml.groupby("Cluster Name")[prof_cols].median().sort_index()
     st.write("**Cluster profiles (median)**"); st.dataframe(profile)
 
     pca = PCA(n_components=2, random_state=42)
     X2 = pca.fit_transform(X)
-    figp = px.scatter(pd.DataFrame({"PC1":X2[:,0], "PC2":X2[:,1], "Cluster":labels}),
-                      x="PC1", y="PC2", color="Cluster", title="PCA (2D) by Cluster",
-                      opacity=0.7, height=500)
+    figp = px.scatter(
+        pd.DataFrame({"PC1":X2[:,0], "PC2":X2[:,1], "Cluster":df_ml["Cluster Name"]}),
+        x="PC1", y="PC2", color="Cluster", title="PCA (2D) by Cluster (named)",
+        opacity=0.7, height=500
+    )
     st.plotly_chart(figp, use_container_width=True)
 
-    st.download_button("⬇️ Download data with clusters",
+    st.download_button("⬇️ Download data with clusters (named)",
                        data=df_ml.to_csv(index=False),
-                       file_name="t3_assets_with_clusters.csv",
+                       file_name="t3_assets_with_clusters_named.csv",
                        mime="text/csv")
 
     st.markdown("---")
@@ -380,11 +446,12 @@ with tab_ml:
     st.write(f"**Accuracy:** {acc:.3f}")
 
     cm = confusion_matrix(y_test, y_pred)
-    cm_df = pd.DataFrame(
-        cm,
-        index=[f"True {i}" for i in sorted(np.unique(labels))],
-        columns=[f"Pred {i}" for i in sorted(np.unique(labels))]
-    )
+    # Present confusion by human-readable names for clarity
+    name_map = {i:n for i,n in zip(df_ml["cluster"], df_ml["Cluster Name"])}
+    # The above may contain duplicates; build a clean mapping by medians again
+    clean_map = df_ml.groupby("cluster")["Cluster Name"].agg(lambda s: s.mode().iat[0] if not s.mode().empty else f"Cluster {int(s.iloc[0])}")
+    idx = [clean_map[i] for i in sorted(np.unique(labels))]
+    cm_df = pd.DataFrame(cm, index=[f"True {n}" for n in idx], columns=[f"Pred {n}" for n in idx])
     st.write("**Confusion Matrix**"); st.dataframe(cm_df)
 
     st.write("**Classification Report**")
@@ -394,4 +461,4 @@ with tab_ml:
     fig_imp = px.bar(imp, title="Feature Importances", labels={"index":"feature","value":"importance"})
     st.plotly_chart(fig_imp, use_container_width=True)
 
-st.caption("KPIs are shown in Bn/Mn. Map appears above charts and supports color-by (Confidence/Type/State/Cluster).")
+st.caption("Clusters are shown with friendly names (Core / Tiny-Special / Large-Older). KPIs in Bn/Mn. Map above charts with selectable colors.")
