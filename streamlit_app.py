@@ -1,4 +1,4 @@
-# streamlit_app.py — RWAP Dashboard & ML (Bn/Mn KPIs, Map above charts, Friendly Cluster Names)
+# streamlit_app.py — RWAP Dashboard & ML (Task 2 + Task 3 explained)
 import os
 from pathlib import Path
 import numpy as np
@@ -184,7 +184,28 @@ def assign_cluster_names_from_profile(df_in: pd.DataFrame, cluster_col: str = "c
     df["Cluster Name"] = df[cluster_col].map(name_map)
     return df
 
-# Canonicalize + friendly cluster names (if clusters exist)
+# ---------- ML explainability helpers ----------
+def silhouette_label(s):
+    if s >= 0.65: return "excellent separation"
+    if s >= 0.50: return "good separation"
+    if s >= 0.35: return "moderate separation"
+    if s >= 0.20: return "weak separation"
+    return "poor separation"
+
+def quant_bucket(v, qs=(0.33, 0.66), labels=("small","mid","large")):
+    if v is None or np.isnan(v): return "unknown"
+    q1, q2 = qs
+    if v < q1:  return labels[0]
+    if v < q2:  return labels[1]
+    return labels[2]
+
+def describe_cluster_row(row, q_sqft, q_psf, q_age):
+    size_tag   = quant_bucket(row.get("sqft", np.nan),  q_sqft,  ("small","mid","large"))
+    psf_tag    = quant_bucket(row.get("value_psf", np.nan), q_psf, ("low $/ft²","mid $/ft²","high $/ft²"))
+    age_tag    = quant_bucket(row.get("age", np.nan),   q_age,   ("younger","mid-age","older"))
+    return f"{size_tag} assets, {psf_tag}, {age_tag}."
+
+# -------------------- Prepare data --------------------
 df = canonicalize(raw)
 if "cluster" in df.columns:
     df = assign_cluster_names_from_profile(df, "cluster")
@@ -388,7 +409,15 @@ with tab_dash:
 # ================== TAB 2 – TASK 3 ML =================
 # =====================================================
 with tab_ml:
-    st.subheader("Clustering (KMeans) + Classification (RandomForest)")
+    st.info(
+        "**How to read Task 3**  \n"
+        "1) Choose **k** — we try to group similar assets.  \n"
+        "2) **Silhouette** shows how well clusters separate (≥0.50 is good).  \n"
+        "3) Check **sizes** & **profiles** to understand each cluster.  \n"
+        "4) **PCA** is a 2D picture for intuition (not used by the model).  \n"
+        "5) A **RandomForest** predicts cluster for new assets; we report accuracy and a confusion matrix."
+    )
+
     must = ["value","sqft","value_psf"]
     if not all(c in df.columns for c in must):
         st.warning("CSV must include: value, sqft, value_psf (auto-generated if value & sqft exist).")
@@ -410,33 +439,101 @@ with tab_ml:
     km = KMeans(n_clusters=k, n_init="auto", random_state=42)
     labels = km.fit_predict(X)
     sil = silhouette_score(X, labels)
-    st.write(f"**Silhouette score:** {sil:.3f}")
 
     df_ml = df.copy()
     df_ml["cluster"] = labels
     df_ml = assign_cluster_names_from_profile(df_ml, "cluster")  # friendly names
 
     sizes = df_ml["cluster"].value_counts().sort_index().rename("count")
-    st.write("**Cluster sizes**"); st.dataframe(sizes)
 
     prof_cols = [c for c in ["value","sqft","value_psf","age"] if c in df_ml.columns]
     profile = df_ml.groupby("Cluster Name")[prof_cols].median().sort_index()
-    st.write("**Cluster profiles (median)**"); st.dataframe(profile)
 
+    # ----- A) KPIs and quick interpretation -----
+    st.markdown("### ML KPIs")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Clusters (k)", f"{k}")
+    c2.metric("Silhouette", f"{sil:0.3f}")
+    c3.metric("Interpretation", silhouette_label(sil))
+
+    # ----- B) Cluster size chart -----
+    sizes_named = df_ml["Cluster Name"].value_counts().reset_index()
+    sizes_named.columns = ["Cluster Name", "count"]
+    fig_sizes = px.bar(
+        sizes_named.sort_values("count", ascending=False),
+        x="Cluster Name", y="count", color="Cluster Name",
+        title="Cluster sizes (count)", text="count"
+    )
+    fig_sizes.update_traces(textposition="outside")
+    st.plotly_chart(fig_sizes, use_container_width=True)
+
+    # ----- C) Profile cards (one-liners) -----
+    st.markdown("### Cluster profile (one sentence each)")
+    q_sqft = profile["sqft"].quantile([0.33, 0.66]).values if "sqft" in profile.columns else (0, 0)
+    q_psf  = profile["value_psf"].quantile([0.33, 0.66]).values if "value_psf" in profile.columns else (0, 0)
+    q_age  = profile["age"].quantile([0.33, 0.66]).values if "age" in profile.columns else (0, 0)
+
+    cards_per_row = 3
+    names = profile.index.tolist()
+    for i in range(0, len(names), cards_per_row):
+        cols = st.columns(min(cards_per_row, len(names)-i))
+        for j, name in enumerate(names[i:i+cards_per_row]):
+            with cols[j]:
+                row = profile.loc[name]
+                line = describe_cluster_row(row, q_sqft, q_psf, q_age)
+                st.markdown(
+                    f"**{name}**  \n"
+                    f"- Median Value: {fmt_money_units(row.get('value', np.nan))}  \n"
+                    f"- Median Size: {row.get('sqft', np.nan):,.0f} ft²  \n"
+                    f"- Median $/ft²: {fmt_money_units(row.get('value_psf', np.nan))}  \n"
+                    f"- Median Age: {row.get('age', np.nan):,.0f} yrs  \n"
+                    f"**Summary:** {line}"
+                )
+
+    # ----- D) Composition by State / Asset Type -----
+    st.markdown("### Where clusters occur (composition)")
+    left, right = st.columns(2)
+    if "state" in df_ml.columns:
+        comp_state = (df_ml.groupby(["Cluster Name","state"]).size()
+                        .reset_index(name="n"))
+        top_states = (df_ml["state"].value_counts().head(12).index.tolist())
+        comp_state = comp_state[comp_state["state"].isin(top_states)]
+        with left:
+            fig_st = px.bar(
+                comp_state, x="state", y="n", color="Cluster Name",
+                barmode="group", title="Top states by cluster count"
+            )
+            st.plotly_chart(fig_st, use_container_width=True)
+
+    if "asset_type" in df_ml.columns:
+        comp_type = (df_ml.groupby(["Cluster Name","asset_type"]).size()
+                        .reset_index(name="n"))
+        top_types = df_ml["asset_type"].value_counts().head(10).index.tolist()
+        comp_type = comp_type[comp_type["asset_type"].isin(top_types)]
+        with right:
+            fig_ty = px.bar(
+                comp_type, x="asset_type", y="n", color="Cluster Name",
+                barmode="group", title="Top asset types by cluster count"
+            )
+            st.plotly_chart(fig_ty, use_container_width=True)
+
+    # ----- E) PCA plot -----
     pca = PCA(n_components=2, random_state=42)
     X2 = pca.fit_transform(X)
     figp = px.scatter(
         pd.DataFrame({"PC1":X2[:,0], "PC2":X2[:,1], "Cluster":df_ml["Cluster Name"]}),
         x="PC1", y="PC2", color="Cluster", title="PCA (2D) by Cluster (named)",
-        opacity=0.7, height=500
+        opacity=0.7, height=520
     )
     st.plotly_chart(figp, use_container_width=True)
 
+    # Download data with clusters
     st.download_button("⬇️ Download data with clusters (named)",
                        data=df_ml.to_csv(index=False),
                        file_name="t3_assets_with_clusters_named.csv",
                        mime="text/csv")
 
+    # ----- F) RandomForest classifier -----
     st.markdown("---")
     st.subheader("RandomForest: predict cluster")
 
@@ -448,14 +545,22 @@ with tab_ml:
     y_pred = rf.predict(X_test)
 
     acc = (y_pred == y_test).mean()
-    st.write(f"**Accuracy:** {acc:.3f}")
+    st.metric("Accuracy", f"{acc:.3f}")
 
+    # Confusion matrix heatmap
     cm = confusion_matrix(y_test, y_pred)
-    # Build readable index using the most common name per ID
-    name_lookup = df_ml.groupby("cluster")["Cluster Name"].agg(lambda s: s.mode().iat[0] if not s.mode().empty else f"Cluster {int(s.iloc[0])}")
+    name_lookup = df_ml.groupby("cluster")["Cluster Name"].agg(
+        lambda s: s.mode().iat[0] if not s.mode().empty else f"Cluster {int(s.iloc[0])}"
+    )
     idx_names = [name_lookup[i] for i in sorted(np.unique(labels))]
-    cm_df = pd.DataFrame(cm, index=[f"True {n}" for n in idx_names], columns=[f"Pred {n}" for n in idx_names])
-    st.write("**Confusion Matrix**"); st.dataframe(cm_df)
+    fig_cm = px.imshow(
+        cm,
+        x=[f"Pred {n}" for n in idx_names],
+        y=[f"True {n}" for n in idx_names],
+        text_auto=True, color_continuous_scale="Blues",
+        title="Confusion Matrix (counts)"
+    )
+    st.plotly_chart(fig_cm, use_container_width=True)
 
     st.write("**Classification Report**")
     st.text(classification_report(y_test, y_pred))
@@ -464,4 +569,4 @@ with tab_ml:
     fig_imp = px.bar(imp, title="Feature Importances", labels={"index":"feature","value":"importance"})
     st.plotly_chart(fig_imp, use_container_width=True)
 
-st.caption("KPIs in Bn/Mn. Map appears above charts and defaults to friendly Cluster Names. Use DATA_URL secret for large CSVs if needed.")
+st.caption("KPIs in Bn/Mn. Map above charts. Task-3 includes plain-English cluster cards, sizes, composition, PCA, and RF accuracy with heatmap. Use DATA_URL secret for large CSVs.")
