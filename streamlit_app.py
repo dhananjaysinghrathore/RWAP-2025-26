@@ -1,6 +1,7 @@
-# streamlit_app.py — RWAP Dashboard & ML (Task 2 + Task 3 explained)
+# streamlit_app.py — RWAP Dashboard & ML with Live Descriptive Analytics + Forecast
 import os
 from pathlib import Path
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -28,6 +29,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.title("RWAP – Asset Valuation Dashboard & ML")
+st.caption("Group: **CLArX Gurugram**")
 
 # -------------------- Data load (auto) --------------------
 DATA_FILE_BASE = os.getenv("DATA_FILE_BASE", "asset_valuation_results_final_with_confidence")
@@ -205,6 +207,89 @@ def describe_cluster_row(row, q_sqft, q_psf, q_age):
     age_tag    = quant_bucket(row.get("age", np.nan),   q_age,   ("younger","mid-age","older"))
     return f"{size_tag} assets, {psf_tag}, {age_tag}."
 
+# ---------- Time-series helpers ----------
+DATE_COL_PATTERN = re.compile(r"^\d{2}-\d{2}-\d{4}$")  # e.g., 31-07-2025 (DD-MM-YYYY)
+
+def find_date_columns(df: pd.DataFrame):
+    """Return list of numeric columns whose names look like dd-mm-yyyy."""
+    cols = []
+    for c in df.columns:
+        if DATE_COL_PATTERN.match(str(c)) and pd.api.types.is_numeric_dtype(df[c]):
+            cols.append(c)
+    return cols
+
+def melt_timeseries(df_like: pd.DataFrame, id_cols):
+    """Melt wide date columns to long: id_cols + ['date','value_ts']."""
+    date_cols = find_date_columns(df_like)
+    if not date_cols:
+        return pd.DataFrame()
+    long = df_like[id_cols + date_cols].melt(id_vars=id_cols, var_name="date_str", value_name="value_ts")
+    long["date"] = pd.to_datetime(long["date_str"], dayfirst=True, errors="coerce")
+    long = long.dropna(subset=["date", "value_ts"]).sort_values("date")
+    return long
+
+def month_index(dt: pd.Series):
+    return dt.dt.year * 12 + dt.dt.month
+
+def forecast_linear(df_series: pd.DataFrame, horizon=6, log=False):
+    """
+    df_series: columns ['date','value_ts'] monthly-ish.
+    Simple linear trend on month index. Returns df with actual + forecast + bands.
+    """
+    s = df_series.dropna(subset=["date","value_ts"]).copy()
+    if s.empty or s["date"].nunique() < 3:
+        return None
+
+    # aggregate to monthly median to avoid duplicate days
+    s["ym"] = s["date"].dt.to_period("M").dt.to_timestamp()
+    s = s.groupby("ym", as_index=False)["value_ts"].median().sort_values("ym")
+    s["t"] = month_index(s["ym"])
+
+    y = s["value_ts"].astype(float).values
+    x = s["t"].astype(float).values
+    if log:
+        y = np.log(np.clip(y, 1, None))
+
+    # fit y = a*x + b using polyfit
+    try:
+        a, b = np.polyfit(x, y, 1)
+    except Exception:
+        return None
+
+    # predictions (in-sample, to get residuals)
+    y_hat = a*x + b
+    resid = y - y_hat
+    sigma = float(np.nanstd(resid))
+
+    # future months
+    last_t = int(s["t"].iloc[-1])
+    fut_t = np.arange(last_t+1, last_t+1+horizon)
+    fut_dates = pd.period_range(s["ym"].iloc[-1] + 1, periods=horizon, freq="M").to_timestamp()
+    fut_y = a*fut_t + b
+
+    if log:
+        s["pred"] = np.exp(y_hat)
+        s["lower"] = np.exp(y_hat - sigma)
+        s["upper"] = np.exp(y_hat + sigma)
+        fut_pred = np.exp(fut_y)
+        fut_lower = np.exp(fut_y - sigma)
+        fut_upper = np.exp(fut_y + sigma)
+    else:
+        s["pred"] = y_hat
+        s["lower"] = y_hat - sigma
+        s["upper"] = y_hat + sigma
+        fut_pred  = fut_y
+        fut_lower = fut_y - sigma
+        fut_upper = fut_y + sigma
+
+    past = pd.DataFrame({"date": s["ym"], "value": s["value_ts"], "kind": "actual"})
+    past_pred = pd.DataFrame({"date": s["ym"], "value": s["pred"], "kind": "fit",
+                              "lower": s["lower"], "upper": s["upper"]})
+    future = pd.DataFrame({"date": fut_dates, "value": fut_pred, "kind": "forecast",
+                           "lower": fut_lower, "upper": fut_upper})
+    out = pd.concat([past, past_pred, future], ignore_index=True)
+    return out
+
 # -------------------- Prepare data --------------------
 df = canonicalize(raw)
 if "cluster" in df.columns:
@@ -301,7 +386,7 @@ with tab_dash:
             else:
                 geo["radius_m"] = 10000
 
-            # ---- choose color field (prefer friendly Cluster Name) ----
+            # choose color field (prefer friendly Cluster Name)
             color_options = []
             if "Cluster Name" in geo.columns:
                 color_options.append("Cluster Name")
@@ -357,7 +442,7 @@ with tab_dash:
                     data=geo,
                     get_position='[lon, lat]',
                     get_radius='radius_m',
-                    radius_min_pixels=2,   # always visible
+                    radius_min_pixels=2,
                     radius_max_pixels=40,
                     get_fill_color='color',
                     pickable=True, auto_highlight=True,
@@ -368,7 +453,7 @@ with tab_dash:
             st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view, tooltip=tooltip),
                             use_container_width=True)
 
-    # ---------- CHARTS (below map) ----------
+    # ---------- Distributions ----------
     st.markdown("### Distributions")
     cc1, cc2 = st.columns(2)
     if "value" in flt.columns and (flt["value"] > 0).any():
@@ -382,9 +467,10 @@ with tab_dash:
         )
         cc2.plotly_chart(fig_psf, use_container_width=True)
 
+    # ---------- Value vs Size ----------
     st.markdown("### Value vs Rentable Sq.Ft (log-log)")
     if all(c in flt.columns for c in ["sqft","value"]):
-        plot_df = flt.sample(n=min(5000, len(flt)), random_state=0)  # cap for speed
+        plot_df = flt.sample(n=min(5000, len(flt)), random_state=0)
         fig_sc = px.scatter(
             plot_df, x="sqft", y="value",
             hover_data=[c for c in ["asset_name","state","zip"] if c in plot_df.columns],
@@ -393,6 +479,175 @@ with tab_dash:
         if (plot_df["sqft"] > 0).any(): fig_sc.update_xaxes(type="log")
         if (plot_df["value"] > 0).any(): fig_sc.update_yaxes(type="log")
         st.plotly_chart(fig_sc, use_container_width=True)
+
+    # ---------- Time Series & Forecast from historical valuation columns ----------
+    st.markdown("## Time Series & Forecast")
+    st.caption(
+        "Uses historical valuation columns in your CSV whose names look like **DD-MM-YYYY** "
+        "(e.g., `31-10-2024`, `30-11-2024`, …). Forecast = linear trend (option to log)."
+    )
+
+    date_cols = find_date_columns(raw)
+    if date_cols:
+        # Build a working subset that preserves IDs and the date columns
+        id_cols = [c for c in ["asset_name","zip","state","asset_type"] if c in raw.columns]
+        sub = raw.copy()
+        # Apply the same filters as 'flt' if those id columns exist
+        if "state" in flt.columns and "state" in sub.columns: sub = sub[sub["state"].isin(flt["state"].dropna().unique())]
+        if "asset_type" in flt.columns and "asset_type" in sub.columns: sub = sub[sub["asset_type"].isin(flt["asset_type"].dropna().unique())]
+        if "zip" in flt.columns and "zip" in sub.columns and st.session_state.name_q:
+            qs = str(st.session_state.name_q)
+            mask_zip = sub["zip"].astype(str).str.contains(qs, na=False)
+            if "asset_name" in sub.columns:
+                mask_name = sub["asset_name"].astype(str).str.contains(qs, case=False, na=False)
+                mask_zip = mask_zip | mask_name
+            sub = sub[mask_zip]
+
+        ts_long = melt_timeseries(sub, id_cols)
+        if ts_long.empty:
+            st.info("No time-series rows left after filters.")
+        else:
+            # Aggregation choice
+            agg_choice = st.selectbox("Aggregate by", ["All assets (median)", "State", "Asset Type", "ZIP", "Single Asset"], index=0)
+            log_fit = st.checkbox("Use log-scale trend (good for growth rates)", value=False)
+            horizon = st.slider("Forecast horizon (months)", 1, 12, 6)
+
+            if agg_choice == "All assets (median)":
+                series = ts_long.groupby("date", as_index=False)["value_ts"].median()
+                fig_ts = px.line(series, x="date", y="value_ts", title="Median asset value over time")
+                st.plotly_chart(fig_ts, use_container_width=True)
+
+                fc = forecast_linear(series.rename(columns={"value_ts":"value_ts"}), horizon=horizon, log=log_fit)
+                if fc is not None:
+                    fig_fc = px.line(fc, x="date", y="value", color="kind",
+                                     title="Median value: fit + forecast",
+                                     labels={"value":"value"})
+                    if "lower" in fc.columns:
+                        fig_fc.add_traces([
+                            px.scatter(fc[fc["kind"]=="forecast"], x="date", y="lower").data[0],
+                            px.scatter(fc[fc["kind"]=="forecast"], x="date", y="upper").data[0],
+                        ])
+                    st.plotly_chart(fig_fc, use_container_width=True)
+                else:
+                    st.info("Need at least 3 months of history for forecasting.")
+
+            elif agg_choice in ["State", "Asset Type", "ZIP"]:
+                key = {"State":"state", "Asset Type":"asset_type", "ZIP":"zip"}[agg_choice]
+                choices = sorted(ts_long[key].dropna().unique().tolist())
+                if not choices:
+                    st.info(f"No {key} values after filters.")
+                else:
+                    pick = st.selectbox(f"Choose {agg_choice}", choices)
+                    series = ts_long[ts_long[key]==pick].groupby("date", as_index=False)["value_ts"].median()
+                    fig_ts = px.line(series, x="date", y="value_ts", title=f"Median value over time — {agg_choice}: {pick}")
+                    st.plotly_chart(fig_ts, use_container_width=True)
+
+                    fc = forecast_linear(series.rename(columns={"value_ts":"value_ts"}), horizon=horizon, log=log_fit)
+                    if fc is not None:
+                        fig_fc = px.line(fc, x="date", y="value", color="kind",
+                                         title=f"Forecast — {agg_choice}: {pick}",
+                                         labels={"value":"value"})
+                        st.plotly_chart(fig_fc, use_container_width=True)
+                    else:
+                        st.info("Need at least 3 months of history for forecasting.")
+
+            else:  # Single Asset
+                if "asset_name" not in ts_long.columns:
+                    st.info("Single-asset view needs an 'asset_name' column.")
+                else:
+                    names = sorted(ts_long["asset_name"].dropna().unique().tolist())
+                    pick = st.selectbox("Choose asset", names)
+                    series = ts_long[ts_long["asset_name"]==pick][["date","value_ts"]].sort_values("date")
+                    fig_ts = px.line(series, x="date", y="value_ts", title=f"Asset value over time — {pick}")
+                    st.plotly_chart(fig_ts, use_container_width=True)
+
+                    fc = forecast_linear(series, horizon=horizon, log=log_fit)
+                    if fc is not None:
+                        fig_fc = px.line(fc, x="date", y="value", color="kind",
+                                         title=f"Forecast — {pick}", labels={"value":"value"})
+                        st.plotly_chart(fig_fc, use_container_width=True)
+                    else:
+                        st.info("Need at least 3 months of history for forecasting.")
+    else:
+        st.info("No historical valuation columns (DD-MM-YYYY) detected in your CSV — time series is skipped.")
+
+    # ---------- More Analytics (Task 2) ----------
+    st.markdown("## More Analytics (Task 2)")
+
+    # A) US Choropleth: Median $/ft² by State
+    st.markdown(
+        "**Where are the pricier markets?** Choropleth highlights states by **median $/ft²**."
+    )
+    if "state" in flt.columns and flt["state"].notna().any():
+        state_agg = flt.groupby("state", as_index=False).agg(
+            median_psf=("value_psf","median"),
+            total_value=("value","sum"),
+            n=("state","size"),
+        )
+        state_agg["total_value_fmt"] = state_agg["total_value"].apply(fmt_money_units)
+        fig_choro = px.choropleth(
+            state_agg,
+            locations="state", locationmode="USA-states", scope="usa",
+            color="median_psf", color_continuous_scale="Blues",
+            hover_data={"state":True, "median_psf":":.0f", "total_value_fmt":True, "n":True}
+        )
+        fig_choro.update_layout(title="Median $/ft² by State", coloraxis_colorbar_title="$ / ft²")
+        st.plotly_chart(fig_choro, use_container_width=True)
+
+    # B) Box plot: $/ft² by Asset Type
+    st.markdown("**How does $/ft² vary across types?** Box plot shows spread and outliers.")
+    if {"asset_type","value_psf"}.issubset(flt.columns):
+        tmp = flt[["asset_type","value_psf"]].dropna().copy()
+        if len(tmp) > 0:
+            p99 = tmp["value_psf"].quantile(0.99)
+            tmp = tmp[tmp["value_psf"] <= p99]
+            fig_box = px.box(tmp, x="asset_type", y="value_psf", points="suspectedoutliers",
+                             title="Value per Sq.Ft by Asset Type")
+            fig_box.update_xaxes(title="")
+            fig_box.update_yaxes(title="$ / ft²")
+            st.plotly_chart(fig_box, use_container_width=True)
+
+    # C) Correlation heatmap (Spearman)
+    st.markdown("**Which features move together?** Spearman correlation handles skew.")
+    num_cols = [c for c in ["value","sqft","value_psf","age"] if c in flt.columns]
+    if len(num_cols) >= 2:
+        corr = (flt[num_cols].replace([np.inf,-np.inf], np.nan)
+                        .dropna()
+                        .corr(method="spearman"))
+        fig_corr = px.imshow(
+            corr, text_auto=True, color_continuous_scale="RdBu", zmin=-1, zmax=1,
+            title="Correlation (Spearman)"
+        )
+        st.plotly_chart(fig_corr, use_container_width=True)
+
+    # D) Top cities by total value
+    st.markdown("**Which cities concentrate the most value?**")
+    if {"city","value"}.issubset(flt.columns):
+        city_agg = flt.groupby("city", as_index=False).agg(
+            total_value=("value","sum"), n=("city","size")
+        )
+        top = city_agg.sort_values("total_value", ascending=False).head(15).copy()
+        top["total_value_bn"] = top["total_value"] / 1e9
+        fig_city = px.bar(
+            top, x="city", y="total_value_bn", text="n",
+            title="Top 15 Cities by Total Value", labels={"total_value_bn":"Total Value (Bn)"}
+        )
+        fig_city.update_traces(textposition="outside")
+        fig_city.update_xaxes(title="")
+        st.plotly_chart(fig_city, use_container_width=True)
+
+    # E) $/ft² vs Age
+    st.markdown("**Does age relate to $/ft²?**")
+    if {"value_psf","age"}.issubset(flt.columns):
+        plot_age = flt.dropna(subset=["value_psf","age"]).copy()
+        if len(plot_age) > 0:
+            plot_age = plot_age.sample(n=min(5000, len(plot_age)), random_state=1)
+            color_col = "asset_type" if "asset_type" in plot_age.columns else None
+            fig_age = px.scatter(
+                plot_age, x="age", y="value_psf", color=color_col, opacity=0.5,
+                title="$ / ft² vs Age", labels={"age":"Age (years)","value_psf":"$ / ft²"}
+            )
+            st.plotly_chart(fig_age, use_container_width=True)
 
     # ---------- Table + Download ----------
     st.markdown("### Top 50 by Value")
@@ -411,11 +666,11 @@ with tab_dash:
 with tab_ml:
     st.info(
         "**How to read Task 3**  \n"
-        "1) Choose **k** — we try to group similar assets.  \n"
-        "2) **Silhouette** shows how well clusters separate (≥0.50 is good).  \n"
-        "3) Check **sizes** & **profiles** to understand each cluster.  \n"
-        "4) **PCA** is a 2D picture for intuition (not used by the model).  \n"
-        "5) A **RandomForest** predicts cluster for new assets; we report accuracy and a confusion matrix."
+        "1) Choose **k** — we group similar assets.  \n"
+        "2) **Silhouette** shows separation (≥0.50 is good).  \n"
+        "3) See **sizes** and **profiles** for each cluster.  \n"
+        "4) **PCA** gives a 2D picture (not used by the model).  \n"
+        "5) **RandomForest** predicts cluster for new assets; we report accuracy."
     )
 
     must = ["value","sqft","value_psf"]
@@ -449,14 +704,14 @@ with tab_ml:
     prof_cols = [c for c in ["value","sqft","value_psf","age"] if c in df_ml.columns]
     profile = df_ml.groupby("Cluster Name")[prof_cols].median().sort_index()
 
-    # ----- A) KPIs and quick interpretation -----
+    # KPIs
     st.markdown("### ML KPIs")
     c1, c2, c3 = st.columns(3)
     c1.metric("Clusters (k)", f"{k}")
     c2.metric("Silhouette", f"{sil:0.3f}")
     c3.metric("Interpretation", silhouette_label(sil))
 
-    # ----- B) Cluster size chart -----
+    # Cluster sizes bar
     sizes_named = df_ml["Cluster Name"].value_counts().reset_index()
     sizes_named.columns = ["Cluster Name", "count"]
     fig_sizes = px.bar(
@@ -467,8 +722,8 @@ with tab_ml:
     fig_sizes.update_traces(textposition="outside")
     st.plotly_chart(fig_sizes, use_container_width=True)
 
-    # ----- C) Profile cards (one-liners) -----
-    st.markdown("### Cluster profile (one sentence each)")
+    # Profile cards
+    st.markdown("### Cluster profile")
     q_sqft = profile["sqft"].quantile([0.33, 0.66]).values if "sqft" in profile.columns else (0, 0)
     q_psf  = profile["value_psf"].quantile([0.33, 0.66]).values if "value_psf" in profile.columns else (0, 0)
     q_age  = profile["age"].quantile([0.33, 0.66]).values if "age" in profile.columns else (0, 0)
@@ -490,7 +745,7 @@ with tab_ml:
                     f"**Summary:** {line}"
                 )
 
-    # ----- D) Composition by State / Asset Type -----
+    # Composition charts
     st.markdown("### Where clusters occur (composition)")
     left, right = st.columns(2)
     if "state" in df_ml.columns:
@@ -517,7 +772,7 @@ with tab_ml:
             )
             st.plotly_chart(fig_ty, use_container_width=True)
 
-    # ----- E) PCA plot -----
+    # PCA
     pca = PCA(n_components=2, random_state=42)
     X2 = pca.fit_transform(X)
     figp = px.scatter(
@@ -527,13 +782,12 @@ with tab_ml:
     )
     st.plotly_chart(figp, use_container_width=True)
 
-    # Download data with clusters
     st.download_button("⬇️ Download data with clusters (named)",
                        data=df_ml.to_csv(index=False),
                        file_name="t3_assets_with_clusters_named.csv",
                        mime="text/csv")
 
-    # ----- F) RandomForest classifier -----
+    # RandomForest classifier
     st.markdown("---")
     st.subheader("RandomForest: predict cluster")
 
@@ -569,4 +823,4 @@ with tab_ml:
     fig_imp = px.bar(imp, title="Feature Importances", labels={"index":"feature","value":"importance"})
     st.plotly_chart(fig_imp, use_container_width=True)
 
-st.caption("KPIs in Bn/Mn. Map above charts. Task-3 includes plain-English cluster cards, sizes, composition, PCA, and RF accuracy with heatmap. Use DATA_URL secret for large CSVs.")
+st.caption("KPIs in Bn/Mn. Filters drive all charts. Time-series auto-detects DD-MM-YYYY columns and adds linear-trend forecasts.")
