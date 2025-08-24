@@ -221,70 +221,78 @@ with tab_dash:
         if (plot_df["value"] > 0).any(): fig_sc.update_yaxes(type="log")
         st.plotly_chart(fig_sc, use_container_width=True)
 
-    # ---------- Map (Points / Heatmap) ----------
-    st.markdown("### Map")
-    if ("lat" not in flt.columns) or ("lon" not in flt.columns) or flt[["lat","lon"]].dropna().empty:
-        st.info("No geocoded rows to plot. Check filters or CSV columns.")
+    # ---------- Map (visible at any zoom) ----------
+st.markdown("### Map")
+
+if ("lat" not in flt.columns) or ("lon" not in flt.columns) or flt[["lat","lon"]].dropna().empty:
+    st.info("No geocoded rows to plot. Check filters or CSV columns.")
+else:
+    geo = flt.dropna(subset=["lat","lon"]).copy()
+    # keep only sane coordinates
+    geo = geo[geo["lat"].between(-90, 90) & geo["lon"].between(-180, 180)]
+
+    if geo.empty:
+        st.warning("No rows with valid lat/lon after filters.")
     else:
-        geo = flt.dropna(subset=["lat","lon"]).copy()
-        geo = geo[geo["lat"].between(-90,90) & geo["lon"].between(-180,180)]
-        if geo.empty:
-            st.warning("No rows with valid lat/lon after filters.")
+        # --- size in METERS + pixel floor so markers are visible at low zoom ---
+        if "value" in geo.columns and geo["value"].notna().any():
+            v = geo["value"].astype(float).clip(lower=1)
+            vmed = max(float(v.median()), 1.0)
+            scale = (v / vmed).clip(0.05, 20.0) ** 0.35  # compress extremes
+            # 3–40 km => visible at country zooms
+            geo["radius_m"] = (12000 * scale).clip(3000, 40000)
         else:
-            # radius never collapses to zero
-            if "value" in geo.columns and geo["value"].notna().any():
-                v = geo["value"].astype(float).clip(lower=1)
-                vmed = max(float(v.median()), 1.0)
-                scale = (v / vmed).clip(0.1, 10.0) ** 0.35
-                geo["radius"] = (150 * scale).clip(80, 600)
-            else:
-                geo["radius"] = 150
+            geo["radius_m"] = 10000  # 10 km default
 
-            # color by confidence
-            if "conf_cat" in geo.columns:
-                palette = {"High":[0,153,0],"Medium":[255,153,0],"Low":[220,53,69],"Very Low":[130,130,130],"Unknown":[120,120,120]}
-                geo["color"] = geo["conf_cat"].map(palette).apply(lambda c: c if isinstance(c, list) else [50,100,200])
-            else:
-                geo["color"] = [[50,100,200]] * len(geo)
+        # colors by confidence (fallback blue)
+        if "conf_cat" in geo.columns:
+            palette = {"High":[0,153,0], "Medium":[255,153,0], "Low":[220,53,69],
+                       "Very Low":[130,130,130], "Unknown":[120,120,120]}
+            geo["color"] = geo["conf_cat"].map(palette).apply(
+                lambda c: c if isinstance(c, list) else [50,100,200]
+            )
+        else:
+            geo["color"] = [[50,100,200]] * len(geo)
 
-            center_lat = float(geo["lat"].mean()); center_lon = float(geo["lon"].mean())
-            view = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=6 if len(geo)<=10 else 4)
+        center_lat = float(geo["lat"].mean())
+        center_lon = float(geo["lon"].mean())
+        view = pdk.ViewState(
+            latitude=center_lat,
+            longitude=center_lon,
+            zoom=3.5 if len(geo) > 1000 else 4.5
+        )
 
-            view_type = st.radio("Map view", ["Points","Heatmap"], horizontal=True)
-            if view_type == "Heatmap":
-                layer = pdk.Layer(
-                    "HeatmapLayer",
-                    data=geo,
-                    get_position='[lon, lat]',
-                    get_weight='value' if "value" in geo.columns else None,
-                    aggregation='MEAN',
-                    radiusPixels=60,
-                )
-            else:
-                layer = pdk.Layer(
-                    "ScatterplotLayer",
-                    data=geo,
-                    get_position='[lon, lat]',
-                    get_radius="radius",
-                    get_fill_color="color",
-                    pickable=True, auto_highlight=True,
-                )
+        # Points with min/max pixel size so they don't disappear
+        layer_points = pdk.Layer(
+            "ScatterplotLayer",
+            data=geo,
+            get_position='[lon, lat]',
+            get_radius='radius_m',          # meters
+            radius_min_pixels=2,            # always at least 2 px
+            radius_max_pixels=40,           # don't get too huge
+            get_fill_color='color',
+            pickable=True,
+            auto_highlight=True,
+        )
 
-            tooltip = {"html":"<b>{asset_name}</b><br/>${value:,.0f}<br/>{state} {zip}",
-                       "style":{"backgroundColor":"steelblue","color":"white"}}
-            st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view, tooltip=tooltip),
-                            use_container_width=True)
+        # Optional heatmap (nice when many points)
+        layer_heat = pdk.Layer(
+            "HeatmapLayer",
+            data=geo,
+            get_position='[lon, lat]',
+            get_weight='value' if "value" in geo.columns else None,
+            radiusPixels=70,
+        )
 
-    # ---------- Table + Download ----------
-    st.markdown("### Top 50 by Value")
-    if "value" in flt.columns:
-        top = flt.sort_values("value", ascending=False).head(50)
-        st.dataframe(top, use_container_width=True)
+        tooltip = {
+            "html": "<b>{asset_name}</b><br/>${value:,.0f}<br/>{state} {zip}",
+            "style": {"backgroundColor": "steelblue", "color": "white"},
+        }
 
-    st.download_button("⬇️ Download filtered CSV",
-                       data=flt.to_csv(index=False),
-                       file_name="filtered_assets.csv",
-                       mime="text/csv")
+        view_type = st.radio("Map view", ["Points", "Heatmap"], horizontal=True, index=0)
+        layer = layer_points if view_type == "Points" else layer_heat
+        st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view, tooltip=tooltip),
+                        use_container_width=True)
 
 # =====================================================
 # ================== TAB 2 – TASK 3 ML =================
