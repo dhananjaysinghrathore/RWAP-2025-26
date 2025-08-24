@@ -12,7 +12,7 @@ This project delivers a full pipeline for valuing real-estate assets, exploring 
 **Dataset Type:** Structured, GIS  
 **Software:** Python (Colab, Streamlit), Python libraries (see below)  
 **Deliverables:** Analytical Dashboard (web), Analytical Report (Colab/Notebook), Project Presentation (≤10 slides)  
-**Storage:** Code & Report in GitHub (folder `RWAP_2025-26`)
+**Storage:** Code & Report in GitHub (folder `RWAP-2025-26`)
 
 ### Tasks
 1) **Asset Valuation Model** — Estimate asset values in Dataset-1 using valuation index in Dataset-2.  
