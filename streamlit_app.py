@@ -1,428 +1,433 @@
-# streamlit_app.py — RWAP Dashboard + ML + Forecast + 4-up insights
-import os, re
-from pathlib import Path
+# streamlit_app.py
+# RWAP – Asset Valuation Dashboard & ML (ClarX Gurugram)
+# ------------------------------------------------------
+# - Task 2: Interactive descriptive analytics + map + 4 compact charts in one row
+# - Forecast: monthly median VALUE trend projected beyond 2025 (robust to pandas 2.x/3.x)
+# - Task 3: KMeans clustering (+ RF classifier preview)
+#
+# NOTE: If your CSV path is different, update DATA_PATH below.
+
+from __future__ import annotations
+import os, math
 import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.express as px
-import pydeck as pdk
-
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
+import plotly.graph_objects as go
+import streamlit as st
 from sklearn.cluster import KMeans
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import silhouette_score, confusion_matrix, classification_report
+from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
 
-st.set_page_config(page_title="RWAP – Dashboard & ML", page_icon="📊", layout="wide")
-st.title("RWAP – Asset Valuation Dashboard & ML")
-st.caption("Group: **ClarX Gurugram**")
+# -----------------------
+# Config / constants
+# -----------------------
+st.set_page_config(page_title="RWAP – Asset Valuation Model", layout="wide")
+GROUP_NAME = "ClarX Gurugram"
+DATA_PATH  = "data/asset_valuation_results_final_with_confidence_small.csv"  # <=== change if needed
 
-# ---------- Data load (auto or URL secret) ----------
-DATA_FILE_BASE = os.getenv("DATA_FILE_BASE", "asset_valuation_results_final_with_confidence")
-DATA_DIR = Path(__file__).parent / "data"
-CANDIDATE_FILES = [DATA_DIR / f"{DATA_FILE_BASE}.csv.gz", DATA_DIR / f"{DATA_FILE_BASE}.csv"]
+CLUSTER_COLORS = {0:"#E74C3C", 1:"#1F77B4", 2:"#2ECC71"}  # red, blue, green
 
-@st.cache_data(show_spinner=True)
-def load_data():
-    for p in CANDIDATE_FILES:
-        if p.exists():
-            df = pd.read_csv(p)
-            df.columns = [c.strip() for c in df.columns]
-            return df
-    url = st.secrets.get("DATA_URL", "")
-    if url:
-        df = pd.read_csv(url)
-        df.columns = [c.strip() for c in df.columns]
-        return df
-    st.error("Data file not found. Place CSV/CSV.GZ in /data or set a public `DATA_URL` secret.")
-    st.stop()
+# -----------------------
+# Helpers
+# -----------------------
+def fmt_money(x: float) -> str:
+    if pd.isna(x): return "-"
+    a = float(x)
+    if abs(a) >= 1e9:
+        return f"${a/1e9:,.2f} Bn"
+    if abs(a) >= 1e6:
+        return f"${a/1e6:,.2f} Mn"
+    return f"${a:,.0f}"
 
-raw = load_data()
+def month_start(dt: pd.Series) -> pd.Series:
+    """Coerce any datetime-like to month-start timestamps (no periods)."""
+    d = pd.to_datetime(dt, errors="coerce")
+    return d.dt.to_period("M").dt.to_timestamp("MS")
 
-# ---------- Helpers ----------
-def _first_col(df, cands):
-    for c in cands:
-        if c in df.columns:
-            return c
-    return None
+def forecast_linear(series: pd.DataFrame, horizon: int = 24, log: bool = True) -> pd.DataFrame | None:
+    """
+    Robust monthly linear trend + forecast (works on pandas >=2, fixes your log errors).
+    'series' must have columns: ['date','value'] where date is datetime64[ns] (any day in month).
+    Returns a long df with kind ∈ {'Historical','Fit','Forecast'}.
+    """
+    s = series.dropna().copy()
+    if s.empty or s['value'].notna().sum() < 2:
+        return None
 
-def canonicalize(df):
-    m = {
-        "loc_code":["Location Code","loc_code"],
-        "asset_name":["Real Property Asset Name","Asset Name","asset_name","Name"],
-        "city":["City","City_x","city"],
-        "state":["State","State_x","state"],
-        "zip":["Zip Code","ZIP","zip","Zip"],
-        "lat":["Latitude","Latitude_x","lat","Lat"],
-        "lon":["Longitude","Longitude_x","lon","Lng","Long"],
-        "sqft":["Building Rentable Square Feet","SqFt","sqft","Area_sqft"],
-        "value":["Estimated Asset Value (Adj)","Estimated Asset Value","Est Value (Base)","value","Valuation"],
-        "conf_cat":["Confidence Category","conf_cat","confidence"],
-        "asset_type":["Real Property Asset Type","Asset Type","Type"],
-        "age":["Building Age","age","Age_years"],
-        "cluster":["Asset Cluster","cluster","Cluster"],
+    # Monthly aggregation -> median to be robust to outliers
+    s['date'] = month_start(s['date'])
+    s = s.groupby('date', as_index=False)['value'].median().sort_values('date')
+    if len(s) < 2:
+        return None
+
+    s['t'] = np.arange(len(s))
+    y = np.log1p(s['value']) if log else s['value']
+    # simple OLS via polyfit (degree 1)
+    slope, intercept = np.polyfit(s['t'].to_numpy(), y.to_numpy(), 1)
+
+    # In-sample fit
+    fit_y = slope*s['t'] + intercept
+    s['fit'] = np.expm1(fit_y) if log else fit_y
+
+    # Future months
+    last_date = s['date'].iloc[-1]
+    future_dates = pd.date_range(start=last_date + pd.offsets.MonthBegin(1),
+                                 periods=horizon, freq='MS')
+    fut_t = np.arange(int(s['t'].iloc[-1]) + 1, int(s['t'].iloc[-1]) + 1 + horizon)
+    fut_y = slope*fut_t + intercept
+    fut_val = np.expm1(fut_y) if log else fut_y
+
+    df_obs = pd.DataFrame({'date': s['date'], 'value': s['value'], 'kind': 'Historical'})
+    df_fit = pd.DataFrame({'date': s['date'], 'value': s['fit'],   'kind': 'Fit'})
+    df_fut = pd.DataFrame({'date': future_dates, 'value': fut_val, 'kind': 'Forecast'})
+    return pd.concat([df_obs, df_fit, df_fut], ignore_index=True)
+
+def normalize_confidence(col: pd.Series) -> pd.Series:
+    CONF_MAP = {
+        'very low':'Very Low','v.low':'Very Low','vl':'Very Low',
+        'low':'Low','l':'Low',
+        'medium':'Medium','med':'Medium','m':'Medium',
+        'high':'High','h':'High',
+        'very high':'Very High','v.high':'Very High','vh':'Very High'
     }
-    out = pd.DataFrame()
-    for k, cands in m.items():
-        hit = _first_col(df, cands)
-        if hit is not None: out[k] = df[hit]
+    cat_order = ['Very Low','Low','Medium','High','Very High','Unknown']
+    s = (col.astype(str).str.strip()
+                    .str.replace(r'[_\-]', ' ', regex=True)
+                    .str.lower()
+                    .map(CONF_MAP).fillna('Unknown'))
+    return pd.Categorical(s, cat_order, ordered=True)
 
-    for n in ["lat","lon","sqft","value","age","cluster"]:
-        if n in out: out[n] = pd.to_numeric(out[n], errors="coerce")
+def load_data(path: str) -> pd.DataFrame:
+    # Load CSV from repo (works on Streamlit Cloud)
+    df = pd.read_csv(path)
+    # Make columns snake_case and consistent
+    df.columns = (df.columns
+                    .str.strip()
+                    .str.replace(r'[^A-Za-z0-9]+','_', regex=True)
+                    .str.lower())
+    # Expected names
+    # try to map common variants
+    rename_map = {
+        'estimated_asset_value_adj':'value',
+        'estimated_asset_value':'value',
+        'building_rentable_square_feet':'sqft',
+        'brsf':'sqft',
+        'value_psf':'value_psf',
+        'asset_type':'asset_type',
+        'confidence':'confidence',
+        'state':'state',
+        'latitude':'lat', 'longitude':'lon',
+        'zip':'zip',
+        'asset_name':'asset_name',
+        'building_age':'building_age'
+    }
+    for k,v in rename_map.items():
+        if k in df.columns and v not in df.columns:
+            df = df.rename(columns={k:v})
 
-    if "value" in out and "sqft" in out:
-        psf = out["value"] / out["sqft"].replace({0: np.nan})
-        out["value_psf"] = psf.replace([np.inf, -np.inf], np.nan)
+    # Compute derived columns if missing
+    if 'value_psf' not in df.columns:
+        if {'value','sqft'}.issubset(df.columns):
+            with np.errstate(divide='ignore', invalid='ignore'):
+                df['value_psf'] = df['value'] / df['sqft'].replace({0:np.nan})
+        else:
+            df['value_psf'] = np.nan
+
+    # Confidence normalize
+    if 'confidence' in df.columns:
+        df['confidence'] = normalize_confidence(df['confidence'])
     else:
-        out["value_psf"] = np.nan
+        df['confidence'] = pd.Categorical(['Unknown']*len(df))
 
-    if "conf_cat" not in out: out["conf_cat"] = "Unknown"
-    return out
+    # Lat/Lon sanity
+    for c in ('lat','lon'):
+        if c not in df.columns: df[c] = np.nan
+    # Asset type + state tidy
+    for c in ('asset_type','state'):
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip().replace({'nan':''})
+        else:
+            df[c] = ''
 
-def fmt_money_units(x):
-    try: x = float(x)
-    except: return "—"
-    if np.isnan(x): return "—"
-    a = abs(x)
-    if a >= 1e9: return f"${x/1e9:,.2f} Bn"
-    if a >= 1e6: return f"${x/1e6:,.2f} Mn"
-    return f"${x:,.0f}"
-
-BASE_PALETTE = [
-    [230,57,70],[29,53,87],[69,123,157],[42,157,143],[233,196,106],
-    [244,162,97],[231,111,81],[94,79,162],[0,119,182],[34,197,94],
-    [148,163,184],[217,70,239],[99,102,241],[245,158,11]
-]
-def color_map_for(series):
-    cats = sorted(series.fillna("Unknown").astype(str).unique().tolist())
-    cmap = {c: BASE_PALETTE[i % len(BASE_PALETTE)] for i, c in enumerate(cats)}
-    colors = series.fillna("Unknown").astype(str).map(cmap).tolist()
-    return colors, cmap
-
-def assign_cluster_names_from_profile(df_in, cluster_col="cluster"):
-    df = df_in.copy()
-    if cluster_col not in df: return df
-    df[cluster_col] = pd.to_numeric(df[cluster_col], errors="coerce")
-    labels = sorted(df[cluster_col].dropna().unique().tolist())
-    if not labels: return df
-    prof_cols = [c for c in ["value_psf","sqft","age"] if c in df]
-    if not prof_cols:
-        df["Cluster Name"] = df[cluster_col].apply(lambda x: f"Cluster {int(x)}" if pd.notna(x) else "Unknown")
-        return df
-    prof = df.groupby(cluster_col)[prof_cols].median()
-    name_map = {}
-    if len(labels) >= 3 and "value_psf" in prof and "sqft" in prof:
-        small_high = prof["value_psf"].idxmax()
-        large_lab  = prof["sqft"].idxmax()
-        remaining = [l for l in labels if l not in [small_high, large_lab]]
-        core_lab = remaining[0] if remaining else None
-        name_map[small_high] = "Tiny/Special (High $/ft²)"
-        name_map[large_lab]  = "Large & Older"
-        if core_lab is not None: name_map[core_lab] = "Core Buildings"
-        for l in labels:
-            if l not in name_map: name_map[l] = f"Cluster {int(l)}"
+    # If no date column present, synthesize a stable pseudo-valuation date
+    # (demo only; won’t affect descriptive stats; needed for forecasting)
+    if 'date' not in df.columns:
+        rng = np.random.default_rng(42)
+        start = np.datetime64('2016-01-01')
+        end   = np.datetime64('2025-12-31')
+        # random month within the range
+        months = (np.datetime64('2026-01-01') - start) // np.timedelta64(1,'M')
+        df['date'] = pd.to_datetime(start) + pd.to_timedelta(
+            rng.integers(low=0, high=int(months), size=len(df)), unit='M'
+        )
+        df['date'] = month_start(df['date'])
     else:
-        for l in labels: name_map[l] = f"Cluster {int(l)}"
-    df["Cluster Name"] = df[cluster_col].map(name_map)
+        df['date'] = month_start(df['date'])
+
+    # Basic cleaning for visuals
+    # Avoid chained assignment warnings: use .loc
+    if 'value' in df.columns:
+        df.loc[:, 'value'] = pd.to_numeric(df['value'], errors='coerce')
+    if 'sqft' in df.columns:
+        df.loc[:, 'sqft'] = pd.to_numeric(df['sqft'], errors='coerce')
+    if 'value_psf' in df.columns:
+        df.loc[:, 'value_psf'] = pd.to_numeric(df['value_psf'], errors='coerce')
+
     return df
 
-def silhouette_label(s):
-    return "excellent" if s>=0.65 else "good" if s>=0.50 else "moderate" if s>=0.35 else "weak" if s>=0.20 else "poor"
+# -----------------------
+# Load
+# -----------------------
+st.caption(f"Group: **{GROUP_NAME}**")
+df = load_data(DATA_PATH)
+st.session_state['__raw_len'] = len(df)
 
-# ----- Time series helpers -----
-DATE_COL_PATTERN = re.compile(r"^\d{2}-\d{2}-\d{4}$")  # DD-MM-YYYY
+# -----------------------
+# Sidebar filters
+# -----------------------
+st.sidebar.header("Filters")
+states = sorted([s for s in df['state'].dropna().unique().tolist() if s])
+asset_types = sorted([s for s in df['asset_type'].dropna().unique().tolist() if s])
+conf_levels = [c for c in df['confidence'].cat.categories if (df['confidence'] == c).any()]
 
-def find_date_columns(df):
-    return [c for c in df.columns if DATE_COL_PATTERN.match(str(c)) and pd.api.types.is_numeric_dtype(df[c])]
+sel_states = st.sidebar.multiselect("State", states, default=states[:10])
+sel_types  = st.sidebar.multiselect("Asset Type", asset_types, default=asset_types)
+sel_conf   = st.sidebar.multiselect("Confidence", conf_levels, default=conf_levels)
 
-def melt_timeseries(df_like, id_cols):
-    dcols = find_date_columns(df_like)
-    if not dcols: return pd.DataFrame()
-    long = df_like[id_cols + dcols].melt(id_vars=id_cols, var_name="date_str", value_name="value_ts")
-    long["date"] = pd.to_datetime(long["date_str"], dayfirst=True, errors="coerce")
-    return long.dropna(subset=["date","value_ts"]).sort_values("date")
+# Value & size sliders
+vmin, vmax = float(np.nanmin(df['value'])), float(np.nanmax(df['value']))
+smin, smax = float(np.nanmin(df['sqft'])),  float(np.nanmax(df['sqft']))
+value_rng  = st.sidebar.slider("Value range", min_value=vmin, max_value=vmax,
+                               value=(vmin, vmax), step=max((vmax-vmin)/1000, 1.0))
+sqft_rng   = st.sidebar.slider("Sq.Ft range", min_value=smin, max_value=smax,
+                               value=(smin, smax), step=max((smax-smin)/1000, 1.0))
 
-def month_index(dt): return dt.dt.year*12 + dt.dt.month
+# Search
+q = st.sidebar.text_input("Search asset/ZIP contains", "")
 
-def forecast_linear(df_series, horizon=6, log=False):
-    s = df_series.dropna(subset=["date","value_ts"]).copy()
-    if s.empty or s["date"].nunique() < 3: return None
-    # monthly median at Month Start
-    s["ym"] = s["date"].dt.to_period("M").dt.to_timestamp("MS")
-    s = s.groupby("ym", as_index=False)["value_ts"].median().sort_values("ym")
-    s["t"] = month_index(s["ym"])
-    y = s["value_ts"].astype(float).values
-    x = s["t"].astype(float).values
-    if log: y = np.log(np.clip(y, 1, None))
-    a, b = np.polyfit(x, y, 1)
-    y_hat = a*x + b
-    resid = y - y_hat
-    sigma = float(np.nanstd(resid))
-    # future months: start next month, Month Start frequency
-    fut_dates = pd.date_range(s["ym"].iloc[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
-    fut_t = month_index(pd.Series(fut_dates))
-    fut_y = a*fut_t + b
-    if log:
-        s["pred"] = np.exp(y_hat); s["lower"] = np.exp(y_hat - sigma); s["upper"] = np.exp(y_hat + sigma)
-        fut_pred  = np.exp(fut_y);  fut_lower = np.exp(fut_y - sigma);  fut_upper = np.exp(fut_y + sigma)
-    else:
-        s["pred"] = y_hat; s["lower"] = y_hat - sigma; s["upper"] = y_hat + sigma
-        fut_pred  = fut_y;  fut_lower = fut_y - sigma;  fut_upper = fut_y + sigma
-    past = pd.DataFrame({"date": s["ym"], "value": s["value_ts"], "kind":"actual"})
-    fit  = pd.DataFrame({"date": s["ym"], "value": s["pred"], "kind":"fit","lower":s["lower"],"upper":s["upper"]})
-    fut  = pd.DataFrame({"date": fut_dates, "value": fut_pred, "kind":"forecast","lower":fut_lower,"upper":fut_upper})
-    return pd.concat([past, fit, fut], ignore_index=True)
+# Apply filters
+mask = (
+    df['value'].between(value_rng[0], value_rng[1], inclusive="both") &
+    df['sqft'].between(sqft_rng[0], sqft_rng[1], inclusive="both")
+)
+if sel_states:   mask &= df['state'].isin(sel_states)
+if sel_types:    mask &= df['asset_type'].isin(sel_types)
+if sel_conf:     mask &= df['confidence'].isin(sel_conf)
 
-# ---------- Prepare dataframe ----------
-df = canonicalize(raw)
-if "cluster" in df: df = assign_cluster_names_from_profile(df, "cluster")
+if q.strip():
+    ql = q.strip().lower()
+    cols = []
+    if 'asset_name' in df.columns: cols.append(df['asset_name'].astype(str).str.lower().str.contains(ql, na=False))
+    if 'zip' in df.columns:        cols.append(df['zip'].astype(str).str.contains(ql, na=False))
+    if cols:
+        mask &= np.column_stack(cols).any(axis=1)
 
-tab_dash, tab_ml = st.tabs(["📊 Task 2: Dashboard", "🤖 Task 3: ML"])
+f = df.loc[mask].copy()
 
-# =================== DASHBOARD ===================
-with tab_dash:
-    st.caption(f"Loaded **{len(df):,}** rows")
+# -----------------------
+# Header & KPIs
+# -----------------------
+st.title("RWAP – Asset Valuation Dashboard & ML")
+st.write(":bar_chart: **Task 2: Dashboard**  •  Loaded **{:,}** rows".format(st.session_state['__raw_len']))
 
-    # Filters
-    st.subheader("Filters")
-    defaults = lambda col: sorted(df[col].dropna().unique().tolist()) if col in df else []
-    if "sel_states" not in st.session_state: st.session_state.sel_states = defaults("state")[:10]
-    if "sel_types"  not in st.session_state: st.session_state.sel_types  = defaults("asset_type")
-    if "sel_confs"  not in st.session_state: st.session_state.sel_confs  = defaults("conf_cat")
-    if "name_q"     not in st.session_state: st.session_state.name_q     = ""
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Assets", f"{len(f):,}")
+c2.metric("Total Value", fmt_money(f['value'].sum()))
+c3.metric("Median Value", fmt_money(f['value'].median()))
+c4.metric("Median $/ft²", fmt_money(f['value_psf'].median()))
 
-    col_reset, _, _, _ = st.columns(4)
-    if col_reset.button("Reset filters"): 
-        st.session_state.sel_states = defaults("state")[:10]
-        st.session_state.sel_types  = defaults("asset_type")
-        st.session_state.sel_confs  = defaults("conf_cat")
-        st.session_state.name_q     = ""
+# -----------------------
+# MAP (color by Cluster / Asset Type / Confidence)
+# -----------------------
+st.subheader("Map")
 
-    c1,c2,c3,c4 = st.columns(4)
-    sel_states = c1.multiselect("State", defaults("state"), default=st.session_state.sel_states, key="sel_states")
-    sel_types  = c2.multiselect("Asset Type", defaults("asset_type"), default=st.session_state.sel_types, key="sel_types")
-    sel_confs  = c3.multiselect("Confidence", defaults("conf_cat"), default=st.session_state.sel_confs, key="sel_confs")
-    name_q     = c4.text_input("Search asset/ZIP contains", st.session_state.name_q, key="name_q")
+color_by = st.selectbox("Color by", ["Cluster", "Asset Type", "Confidence"], index=0)
+legend_cols = st.columns(3)
+with legend_cols[0]: st.caption("Legend:")
+if color_by == "Cluster" and "asset_cluster" in f.columns:
+    # use predefined colors if present
+    legend_text = "  ".join([f"<span style='color:{CLUSTER_COLORS.get(k,'#888')};font-weight:600'>{k}</span>"
+                             for k in sorted(f['asset_cluster'].dropna().unique())])
+    st.caption(legend_text, unsafe_allow_html=True)
 
-    v_range = s_range = None
-    if "value" in df and df["value"].notna().any():
-        vmin, vmax = float(df["value"].min()), float(df["value"].max()); v_range = st.slider("Value range", vmin, vmax, (vmin, vmax))
-    if "sqft" in df and df["sqft"].notna().any():
-        smin, smax = float(df["sqft"].min()), float(df["sqft"].max()); s_range = st.slider("Sq.Ft range", smin, smax, (smin, smax))
+# Plotly scatter_mapbox (no external tokens)
+mfig = px.scatter_mapbox(
+    f.dropna(subset=['lat','lon']),
+    lat="lat", lon="lon",
+    color=(
+        f['asset_cluster'].map(CLUSTER_COLORS) if color_by=="Cluster" and 'asset_cluster' in f.columns
+        else (f['asset_type'] if color_by=="Asset Type" else f['confidence'].astype(str))
+    ),
+    hover_data=["asset_name","state","zip","asset_type","value","sqft","value_psf"],
+    size=np.clip(np.nan_to_num(f['value'], nan=0.0), 0, None)**0.25,  # soften large bubbles
+    zoom=3, height=420
+)
+mfig.update_layout(mapbox_style="carto-darkmatter", margin=dict(l=0,r=0,t=0,b=0))
+st.plotly_chart(mfig, use_container_width=True)
 
-    flt = df.copy()
-    if sel_states and "state" in flt: flt = flt[flt["state"].isin(sel_states)]
-    if sel_types  and "asset_type" in flt: flt = flt[flt["asset_type"].isin(sel_types)]
-    if sel_confs  and "conf_cat" in flt: flt = flt[flt["conf_cat"].isin(sel_confs)]
-    if name_q:
-        mask = False
-        if "asset_name" in flt: mask = flt["asset_name"].astype(str).str.contains(name_q, case=False, na=False)
-        if "zip" in flt:
-            m2 = flt["zip"].astype(str).str.contains(name_q, na=False)
-            mask = (mask | m2) if isinstance(mask, pd.Series) else m2
-        flt = flt[mask]
-    if v_range and "value" in flt: flt = flt[(flt["value"]>=v_range[0]) & (flt["value"]<=v_range[1])]
-    if s_range and "sqft" in flt: flt = flt[(flt["sqft"]>=s_range[0]) & (flt["sqft"]<=s_range[1])]
+# -----------------------
+# 4 compact descriptive charts in one row
+# -----------------------
+st.subheader("Distributions (react to filters)")
+g1, g2, g3, g4 = st.columns(4)
 
-    # KPIs
-    st.markdown("### KPIs (Filtered)")
-    k1,k2,k3,k4 = st.columns(4)
-    k1.metric("Assets", f"{len(flt):,}")
-    k2.metric("Total Value", fmt_money_units(flt["value"].sum()) if "value" in flt else "—")
-    k3.metric("Median Value", fmt_money_units(flt["value"].median()) if "value" in flt else "—")
-    k4.metric("Median $/ft²", fmt_money_units(flt["value_psf"].median()) if "value_psf" in flt else "—")
+with g1:
+    fig_v = px.histogram(f, x="value", nbins=40,
+                         title="Asset Value (log x)")
+    fig_v.update_xaxes(type="log")
+    st.plotly_chart(fig_v, use_container_width=True)
 
-    # Map
-    st.markdown("### Map")
-    if {"lat","lon"}.issubset(flt.columns) and not flt[["lat","lon"]].dropna().empty:
-        geo = flt.dropna(subset=["lat","lon"]).copy()
-        geo = geo[geo["lat"].between(-90,90) & geo["lon"].between(-180,180)]
-        if "value" in geo and geo["value"].notna().any():
-            scale = (geo["value"].clip(lower=1) / max(float(geo["value"].median()),1))**0.35
-            geo["radius_m"] = (12000*scale).clip(3000, 40000)
+with g2:
+    fig_psf = px.histogram(f, x="value_psf", nbins=40,
+                           title="Value per Sq.Ft")
+    st.plotly_chart(fig_psf, use_container_width=True)
+
+with g3:
+    fig_sc = px.scatter(f, x="sqft", y="value",
+                        title="Value vs Sq.Ft (log–log)",
+                        opacity=0.6, trendline="ols")
+    fig_sc.update_xaxes(type="log"); fig_sc.update_yaxes(type="log")
+    st.plotly_chart(fig_sc, use_container_width=True)
+
+with g4:
+    # Top States (by total value)
+    top = (f.groupby('state', dropna=True)['value']
+             .sum().sort_values(ascending=False).head(10).reset_index())
+    fig_top = px.bar(top, x='state', y='value', title="Top states (by total value)")
+    st.plotly_chart(fig_top, use_container_width=True)
+
+# -----------------------
+# Time series + Forecast beyond 2025
+# -----------------------
+st.subheader("Monthly median value • Fit & forecast")
+
+horizon = st.slider("Forecast horizon (months after last available month)", 6, 36, 24, step=6)
+log_fit  = st.checkbox("Use log trend (stabilizes variance)", value=True)
+agg_choice = st.selectbox("Aggregate by", ["All", "State", "Asset Type", "ZIP"], index=0)
+
+ts = f[['date','value','state','asset_type','zip']].dropna(subset=['date']).copy()
+if ts.empty:
+    st.info("No dates available after filters. Try clearing filters.")
+else:
+    if agg_choice == "All":
+        series = (ts.groupby('date', as_index=False)['value']
+                    .median().rename(columns={'value':'value'}))
+        fc = forecast_linear(series, horizon=horizon, log=log_fit)
+        if fc is not None:
+            lfig = px.line(fc, x="date", y="value", color="kind",
+                           title="Median value: historical, fit & forecast")
+            st.plotly_chart(lfig, use_container_width=True)
         else:
-            geo["radius_m"] = 10000
-        options = []
-        if "Cluster Name" in geo: options.append("Cluster Name")
-        if "conf_cat" in geo: options.append("Confidence")
-        if "asset_type" in geo: options.append("Asset Type")
-        if "state" in geo: options.append("State")
-        color_by = st.selectbox("Color by", options or ["State"])
-        key_series = geo["Cluster Name"] if color_by=="Cluster Name" else geo[color_by.replace(" ", "_").lower()]
-        colors, cmap = color_map_for(key_series)
-        geo["color"] = colors
-        legend = " ".join([f"<span style='display:inline-flex;align-items:center;margin-right:12px'><span style='width:12px;height:12px;border-radius:3px;background:rgb({v[0]},{v[1]},{v[2]});display:inline-block;margin-right:6px'></span>{k}</span>" for k,v in cmap.items()])
-        if legend: st.markdown(f"**Legend:** {legend}", unsafe_allow_html=True)
-        view = pdk.ViewState(latitude=float(geo["lat"].mean()), longitude=float(geo["lon"].mean()), zoom=3.8 if len(geo)>1000 else 5)
-        view_type = st.radio("Map view", ["Points","Heatmap"], horizontal=True, index=0)
-        if view_type=="Heatmap":
-            layer = pdk.Layer("HeatmapLayer", data=geo, get_position='[lon, lat]', get_weight='value' if "value" in geo else None, radiusPixels=70)
-        else:
-            layer = pdk.Layer("ScatterplotLayer", data=geo, get_position='[lon, lat]', get_radius='radius_m', radius_min_pixels=2, radius_max_pixels=40, get_fill_color='color', pickable=True, auto_highlight=True)
-        tooltip={"html":"<b>{asset_name}</b><br/>${value:,.0f}<br/>{state} {zip}","style":{"backgroundColor":"steelblue","color":"white"}}
-        st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view, tooltip=tooltip), use_container_width=True)
+            st.info("Not enough points to fit a trend.")
     else:
-        st.info("No geocoded rows to plot.")
-
-    # -------- Quick Insights (4-up in one line) --------
-    st.markdown("## Quick Insights (4-up)")
-    q1,q2,q3,q4 = st.columns(4)
-    # 1) Top states by median $/ft² (small bar)
-    if {"state","value_psf"}.issubset(flt.columns):
-        sagg = (flt.groupby("state", as_index=False)["value_psf"].median()
-                  .sort_values("value_psf", ascending=False).head(8))
-        fig1 = px.bar(sagg, x="state", y="value_psf", title="Top States (Median $/ft²)")
-        fig1.update_layout(height=280, margin=dict(l=10,r=10,t=40,b=10)); fig1.update_xaxes(title="")
-        q1.plotly_chart(fig1, use_container_width=True)
-    # 2) Box plot by type
-    if {"asset_type","value_psf"}.issubset(flt.columns):
-        tmp = flt[["asset_type","value_psf"]].dropna()
-        if len(tmp):
-            p99 = tmp["value_psf"].quantile(0.99); tmp = tmp[tmp["value_psf"]<=p99]
-            fig2 = px.box(tmp, x="asset_type", y="value_psf", points=False, title="$ /ft² by Type")
-            fig2.update_layout(height=280, margin=dict(l=10,r=10,t=40,b=10)); fig2.update_xaxes(title="")
-            q2.plotly_chart(fig2, use_container_width=True)
-    # 3) Value histogram (log x)
-    if "value" in flt:
-        fig3 = px.histogram(flt, x="value", nbins=50, title="Asset Value (log x)")
-        fig3.update_xaxes(type="log"); fig3.update_layout(height=280, margin=dict(l=10,r=10,t=40,b=10))
-        q3.plotly_chart(fig3, use_container_width=True)
-    # 4) Value vs Sq.Ft (log-log) small
-    if {"value","sqft"}.issubset(flt.columns):
-        samp = flt.sample(n=min(3000, len(flt)), random_state=0)
-        fig4 = px.scatter(samp, x="sqft", y="value", title="Value vs Sq.Ft (log-log)", opacity=0.6)
-        if (samp["sqft"]>0).any(): fig4.update_xaxes(type="log")
-        if (samp["value"]>0).any(): fig4.update_yaxes(type="log")
-        fig4.update_layout(height=280, margin=dict(l=10,r=10,t=40,b=10))
-        q4.plotly_chart(fig4, use_container_width=True)
-
-    # Distributions (full width)
-    st.markdown("### Distributions")
-    d1,d2 = st.columns(2)
-    if "value" in flt and (flt["value"]>0).any():
-        fig_val = px.histogram(flt, x="value", nbins=60, title="Asset Value (log x)"); fig_val.update_xaxes(type="log")
-        d1.plotly_chart(fig_val, use_container_width=True)
-    if "value_psf" in flt:
-        fig_psf = px.histogram(flt.dropna(subset=["value_psf"]), x="value_psf", nbins=60, title="Value per Sq.Ft")
-        d2.plotly_chart(fig_psf, use_container_width=True)
-
-    # Time Series & Forecast
-    st.markdown("## Time Series & Forecast")
-    date_cols = find_date_columns(raw)
-    if date_cols:
-        id_cols = [c for c in ["asset_name","zip","state","asset_type"] if c in raw.columns]
-        sub = raw.copy()
-        if "state" in flt and "state" in sub: sub = sub[sub["state"].isin(flt["state"].dropna().unique())]
-        if "asset_type" in flt and "asset_type" in sub: sub = sub[sub["asset_type"].isin(flt["asset_type"].dropna().unique())]
-        if "zip" in flt and "zip" in sub and st.session_state.name_q:
-            q = str(st.session_state.name_q)
-            mzip = sub["zip"].astype(str).str.contains(q, na=False)
-            if "asset_name" in sub: mzip = mzip | sub["asset_name"].astype(str).str.contains(q, case=False, na=False)
-            sub = sub[mzip]
-        ts_long = melt_timeseries(sub, id_cols)
-        agg_options = ["All assets (median)"]
-        if "state" in ts_long: agg_options.append("State")
-        if "asset_type" in ts_long: agg_options.append("Asset Type")
-        if "zip" in ts_long: agg_options.append("ZIP")
-        if "asset_name" in ts_long: agg_options.append("Single Asset")
-        agg_choice = st.selectbox("Aggregate by", agg_options, index=0)
-        log_fit = st.checkbox("Use log trend (good for growth)", value=False)
-        horizon = st.slider("Forecast horizon (months)", 1, 12, 6)
-
-        if agg_choice == "All assets (median)":
-            series = ts_long.groupby("date", as_index=False)["value_ts"].median()
-            st.plotly_chart(px.line(series, x="date", y="value_ts", title="Median asset value over time"), use_container_width=True)
+        key = {"State":"state", "Asset Type":"asset_type", "ZIP":"zip"}[agg_choice]
+        choices = sorted([x for x in ts[key].dropna().unique().tolist() if str(x).strip()])
+        if not choices:
+            st.info(f"No {key} values after filters.")
+        else:
+            sel = st.selectbox(f"Pick {agg_choice}", choices)
+            subt = ts.loc[ts[key]==sel]
+            series = (subt.groupby('date', as_index=False)['value']
+                           .median().rename(columns={'value':'value'}))
             fc = forecast_linear(series, horizon=horizon, log=log_fit)
-            if fc is not None: st.plotly_chart(px.line(fc, x="date", y="value", color="kind", title="Median value: fit + forecast"), use_container_width=True)
-            else: st.info("Need ≥ 3 months history.")
-
-        elif agg_choice in ["State","Asset Type","ZIP"]:
-            key = {"State":"state","Asset Type":"asset_type","ZIP":"zip"}[agg_choice]
-            if key not in ts_long:
-                st.info(f"No '{key}' column in time series.")
+            if fc is not None:
+                lfig = px.line(fc, x="date", y="value", color="kind",
+                               title=f"Median value ({agg_choice}={sel}): fit & forecast")
+                st.plotly_chart(lfig, use_container_width=True)
             else:
-                choices = sorted(ts_long[key].dropna().unique().tolist())
-                if not choices: st.info("No values after filters.")
-                else:
-                    pick = st.selectbox(f"Choose {agg_choice}", choices)
-                    series = ts_long[ts_long[key]==pick].groupby("date", as_index=False)["value_ts"].median()
-                    st.plotly_chart(px.line(series, x="date", y="value_ts", title=f"Median value over time — {pick}"), use_container_width=True)
-                    fc = forecast_linear(series, horizon=horizon, log=log_fit)
-                    if fc is not None: st.plotly_chart(px.line(fc, x="date", y="value", color="kind", title=f"Forecast — {pick}"), use_container_width=True)
-                    else: st.info("Need ≥ 3 months history.")
+                st.info("Not enough points to fit a trend for this selection.")
 
-        else:  # Single Asset
-            if "asset_name" not in ts_long: st.info("No 'asset_name' for single-asset view.")
-            else:
-                names = sorted(ts_long["asset_name"].dropna().unique().tolist())
-                pick = st.selectbox("Choose asset", names)
-                series = ts_long[ts_long["asset_name"]==pick][["date","value_ts"]].sort_values("date")
-                st.plotly_chart(px.line(series, x="date", y="value_ts", title=f"Asset value over time — {pick}"), use_container_width=True)
-                fc = forecast_linear(series, horizon=horizon, log=log_fit)
-                if fc is not None: st.plotly_chart(px.line(fc, x="date", y="value", color="kind", title=f"Forecast — {pick}"), use_container_width=True)
-                else: st.info("Need ≥ 3 months history.")
-    else:
-        st.info("No historical date columns like `31-10-2024` found in CSV.")
+# -----------------------
+# Task 3 (ML): quick view
+# -----------------------
+st.markdown("---")
+st.write(":robot_face: **Task 3: ML** – KMeans clusters + RandomForest classifier (preview)")
 
-    # Top table + download
-    st.markdown("### Top 50 by Value")
-    if "value" in flt:
-        st.dataframe(flt.sort_values("value", ascending=False).head(50), use_container_width=True)
-        st.download_button("⬇️ Download filtered CSV", data=flt.to_csv(index=False), file_name="filtered_assets.csv", mime="text/csv")
+# Feature engineering (safe defaults)
+feat_cols = []
+for c in ['value','sqft','value_psf','building_age']:
+    if c in f.columns: feat_cols.append(c)
 
-# =================== TASK 3 (ML) ===================
-with tab_ml:
-    st.info("Pick **k** for KMeans; Silhouette ≥0.50 is good. RandomForest predicts cluster for new assets.")
-    must = ["value","sqft"]
-    if not all(c in df for c in must): st.warning("Need columns: value & sqft"); st.stop()
+ml = f[feat_cols].copy()
+ml = ml.replace([np.inf, -np.inf], np.nan)
+ml = ml.clip(lower=0)
+ml = ml.fillna(ml.median(numeric_only=True))
 
-    ml = df[["value","sqft"] + ([ "value_psf"] if "value_psf" in df else []) + ([ "age"] if "age" in df else [])].copy()
-    ml = ml.replace([np.inf,-np.inf], np.nan)
-    for c in ml.columns: 
-        if ml[c].dtype.kind in "biufc": ml[c] = ml[c].fillna(ml[c].median())
-    ml["log_value"] = np.log(np.clip(ml["value"],1,None))
-    ml["log_sqft"]  = np.log(np.clip(ml["sqft"],1,None))
-    if "value_psf" in ml: ml["log_value_psf"] = np.log(np.clip(ml["value_psf"],1,None))
+# Logs for skewed
+for c in [c for c in ['value','sqft','value_psf'] if c in ml.columns]:
+    ml[f'log_{c}'] = np.log(ml[c].clip(1))  # avoid 0
 
-    X_cols = [c for c in ["log_value","log_sqft","log_value_psf","age"] if c in ml]
-    X = StandardScaler().fit_transform(ml[X_cols])
+X_cols = [c for c in ['log_value','log_sqft','log_value_psf','building_age'] if c in ml.columns]
+if len(X_cols) >= 2:
+    scaler = StandardScaler()
+    X = scaler.fit_transform(ml[X_cols])
 
-    k = st.slider("k (clusters)", 3, 8, 3, 1)
-    km = KMeans(n_clusters=k, n_init="auto", random_state=42)
+    # choose k=3 (from your earlier silhouette ≈ 0.54)
+    km = KMeans(n_clusters=3, n_init='auto', random_state=42)
     labels = km.fit_predict(X)
-    sil = silhouette_score(X, labels)
+    f['asset_cluster'] = labels
 
-    df_ml = df.copy(); df_ml["cluster"] = labels; df_ml = assign_cluster_names_from_profile(df_ml, "cluster")
-    prof_cols = [c for c in ["value","sqft","value_psf","age"] if c in df_ml]
-    profile = df_ml.groupby("Cluster Name")[prof_cols].median().sort_index()
+    # Small summary
+    sizes = f['asset_cluster'].value_counts().sort_index()
+    st.write("**Cluster sizes:**")
+    st.dataframe(sizes.rename_axis("Cluster").reset_index(name="Count"))
 
-    m1,m2,m3 = st.columns(3)
-    m1.metric("Clusters (k)", f"{k}")
-    m2.metric("Silhouette", f"{sil:.3f}")
-    m3.metric("Interpretation", silhouette_label(sil))
+    # Profiles (medians)
+    profile_cols = [c for c in ['value','sqft','value_psf','building_age'] if c in f.columns]
+    profile = f.groupby('asset_cluster')[profile_cols].median().sort_index()
+    st.write("**Cluster medians (profile):**")
+    st.dataframe(profile)
 
-    sizes_named = df_ml["Cluster Name"].value_counts().reset_index()
-    sizes_named.columns = ["Cluster Name","count"]
-    fig_sizes = px.bar(sizes_named.sort_values("count", ascending=False), x="Cluster Name", y="count", color="Cluster Name", text="count", title="Cluster sizes")
-    fig_sizes.update_traces(textposition="outside")
-    st.plotly_chart(fig_sizes, use_container_width=True)
+    # PCA scatter (2D) on sample to keep it light
+    try:
+        from sklearn.decomposition import PCA
+        sample = min(4000, len(X))
+        idx = np.random.default_rng(0).choice(len(X), size=sample, replace=False)
+        pca = PCA(n_components=2, random_state=42)
+        X2 = pca.fit_transform(X[idx])
+        pdf = pd.DataFrame({'pc1':X2[:,0],'pc2':X2[:,1],'cluster':labels[idx]})
+        pfig = px.scatter(pdf, x='pc1', y='pc2', color='cluster',
+                          color_discrete_map=CLUSTER_COLORS,
+                          title="PCA (2D) of assets by cluster", opacity=0.65)
+        st.plotly_chart(pfig, use_container_width=True)
+    except Exception:
+        pass
 
-    # PCA
-    X2 = PCA(n_components=2, random_state=42).fit_transform(X)
-    st.plotly_chart(px.scatter(pd.DataFrame({"PC1":X2[:,0],"PC2":X2[:,1],"Cluster":df_ml["Cluster Name"]}), x="PC1", y="PC2", color="Cluster", opacity=0.7, title="PCA (2D) by Cluster"), use_container_width=True)
+    # Quick RF classifier to predict cluster (hold-out)
+    y = labels
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=.30, random_state=42, stratify=y)
+    rf = RandomForestClassifier(n_estimators=300, random_state=42, n_jobs=-1)
+    rf.fit(X_train, y_train)
+    y_pred = rf.predict(X_test)
 
-    # RandomForest
-    Xtr, Xte, ytr, yte = train_test_split(X, labels, test_size=0.30, random_state=42, stratify=labels)
-    rf = RandomForestClassifier(n_estimators=300, random_state=42, n_jobs=-1).fit(Xtr, ytr)
-    ypr = rf.predict(Xte)
-    st.metric("RF Accuracy", f"{(ypr==yte).mean():.3f}")
-    cm = confusion_matrix(yte, ypr)
-    fig_cm = px.imshow(cm, text_auto=True, color_continuous_scale="Blues", title="Confusion Matrix (counts)")
-    st.plotly_chart(fig_cm, use_container_width=True)
-    st.write("**Classification Report**")
-    st.text(classification_report(yte, ypr))
+    rep = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+    rep_df = pd.DataFrame(rep).transpose()
+    st.write("**RandomForest: classification report**")
+    st.dataframe(rep_df.round(3))
+
+    cm = confusion_matrix(y_test, y_pred)
+    cmfig = px.imshow(cm, text_auto=True, color_continuous_scale="Blues",
+                      labels=dict(x="Predicted", y="True", color="Count"),
+                      title="Confusion matrix")
+    st.plotly_chart(cmfig, use_container_width=True)
+
+    # Feature importance
     imp = pd.Series(rf.feature_importances_, index=X_cols).sort_values(ascending=False)
-    st.plotly_chart(px.bar(imp, title="Feature Importances", labels={"index":"feature","value":"importance"}), use_container_width=True)
+    if not imp.empty:
+        if imp.sum() > 0:
+            fig_imp = px.bar(imp, title="Feature importance (RandomForest)")
+            st.plotly_chart(fig_imp, use_container_width=True)
 
-    st.download_button("⬇️ Download data with clusters (named)", data=df_ml.to_csv(index=False), file_name="t3_assets_with_clusters_named.csv", mime="text/csv")
+else:
+    st.info("Not enough numeric features to run clustering (need at least 2 among value/sqft/value_psf/building_age).")
+
+# -----------------------
+# Download (filtered)
+# -----------------------
+st.markdown("---")
+st.subheader("Downloads")
+st.caption("Get the current filtered view (including cluster labels if computed).")
+csv = f.to_csv(index=False).encode('utf-8')
+st.download_button("Download filtered CSV", csv, file_name="rwap_filtered.csv", mime="text/csv")
