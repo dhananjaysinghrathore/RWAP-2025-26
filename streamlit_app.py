@@ -564,4 +564,5 @@ with tab_ml:
     imp = pd.Series(rf.feature_importances_, index=X_cols).sort_values(ascending=False)
     fig_imp = px.bar(imp, title="Feature Importances", labels={"index":"feature","value":"importance"})
     st.plotly_chart(fig_imp, use_container_width=True)
-st.caption("KPIs in Bn/Mn. Map above charts. Leaflet maps include a downloadable state bubble map and a cluster map. Task-3 covers clusters + RandomForest."
+
+st.caption("KPIs in Bn/Mn. Map above charts. Leaflet maps include a downloadable state bubble map and a cluster map. Task-3 covers clusters + RandomForest.")
