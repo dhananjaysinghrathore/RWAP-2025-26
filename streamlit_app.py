@@ -16,7 +16,7 @@ from sklearn.ensemble import RandomForestClassifier
 
 st.set_page_config(page_title="RWAP – Dashboard & ML", page_icon="📊", layout="wide")
 st.title("RWAP – Asset Valuation Dashboard & ML")
-st.caption("Group: **CLArX Gurugram**")
+st.caption("Group: **ClarX Gurugram**")
 
 # ---------- Data load (auto or URL secret) ----------
 DATA_FILE_BASE = os.getenv("DATA_FILE_BASE", "asset_valuation_results_final_with_confidence")
