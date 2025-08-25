@@ -1,17 +1,22 @@
-# streamlit_app.py — RWAP Dashboard & ML (Task 2 + Task 3)
-# Group: ClarX Gurugram
-
+# streamlit_app.py — RWAP Dashboard + ML + Leaflet maps
 import os
 from pathlib import Path
+import io
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 import pydeck as pdk
 
+# Leaflet
+import folium
+from folium.plugins import MarkerCluster
+from streamlit_folium import st_folium
+
+# ML
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import silhouette_score, confusion_matrix, classification_report
 from sklearn.ensemble import RandomForestClassifier
@@ -21,7 +26,7 @@ st.set_page_config(page_title="RWAP – Dashboard & ML", page_icon="📊", layou
 st.markdown(
     """
     <style>
-      .block-container {padding-top: 1.0rem; padding-bottom: 1.0rem;}
+      .block-container {padding-top: 1.1rem; padding-bottom: 1.1rem;}
       .legend-swatch {display:inline-block; width:14px; height:14px; border-radius:3px; margin-right:8px;}
       .legend-item {margin-right:14px; display:inline-flex; align-items:center;}
     </style>
@@ -31,7 +36,7 @@ st.markdown(
 st.title("RWAP – Asset Valuation Dashboard & ML")
 st.caption("Group: **ClarX Gurugram**")
 
-# -------------------- Data loader --------------------
+# -------------------- Data load (auto) --------------------
 DATA_FILE_BASE = os.getenv("DATA_FILE_BASE", "asset_valuation_results_final_with_confidence")
 DATA_DIR = Path(__file__).parent / "data"
 CANDIDATE_FILES = [
@@ -41,32 +46,20 @@ CANDIDATE_FILES = [
 
 @st.cache_data(show_spinner=True)
 def load_data() -> pd.DataFrame:
-    # 1) preferred names
     for p in CANDIDATE_FILES:
         if p.exists():
             df = pd.read_csv(p)
             df.columns = [c.strip() for c in df.columns]
             return df
-
-    # 2) any CSV/CSV.GZ in /data (pick the largest/newest)
-    if DATA_DIR.exists():
-        all_csvs = sorted(list(DATA_DIR.glob("*.csv*")), key=lambda x: x.stat().st_size, reverse=True)
-        if all_csvs:
-            df = pd.read_csv(all_csvs[0])
-            df.columns = [c.strip() for c in df.columns]
-            return df
-
-    # 3) public URL via secrets
     url = st.secrets.get("DATA_URL", "")
     if url:
         df = pd.read_csv(url)
         df.columns = [c.strip() for c in df.columns]
         return df
-
     st.error(
         "Data file not found.\n\n"
-        "Place a CSV/CSV.GZ in `/data/` (e.g., "
-        f"`{CANDIDATE_FILES[1].name}`), or set a public link in **Secrets** as `DATA_URL`."
+        f"Expected one of:\n- {CANDIDATE_FILES[0].as_posix()}\n- {CANDIDATE_FILES[1].as_posix()}\n\n"
+        "Upload CSV/CSV.GZ to `/data/`, or set a public link in Secrets as `DATA_URL`."
     )
     st.stop()
 
@@ -107,10 +100,10 @@ def canonicalize(df: pd.DataFrame) -> pd.DataFrame:
         if n in out.columns:
             out[n] = pd.to_numeric(out[n], errors="coerce")
 
-    # Derived $/ft²
+    # $/ft²
     if "value" in out.columns and "sqft" in out.columns:
         out["value_psf"] = out["value"] / out["sqft"]
-        out["value_psf"] = out["value_psf"].replace([np.inf, -np.inf], np.nan)
+        out["value_psf"].replace([np.inf, -np.inf], np.nan, inplace=True)
     else:
         out["value_psf"] = np.nan
 
@@ -121,7 +114,6 @@ def canonicalize(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def fmt_money_units(x: float) -> str:
-    """Format as $X.XX Bn / Mn (else plain $)."""
     try:
         x = float(x)
     except Exception:
@@ -149,75 +141,98 @@ def color_map_for(series: pd.Series):
     return colors, cmap
 
 def assign_cluster_names_from_profile(df_in: pd.DataFrame, cluster_col: str = "cluster") -> pd.DataFrame:
-    """
-    Map numeric cluster IDs to friendly names using medians:
-    - 'Tiny/Special (High $/ft²)' => highest median value_psf
-    - 'Large & Older'             => highest median sqft
-    - 'Core Buildings'            => remaining cohort
-    For k != 3, remaining clusters get generic 'Cluster N'.
-    """
     df = df_in.copy()
     if cluster_col not in df.columns:
         return df
-
-    try:
-        df[cluster_col] = pd.to_numeric(df[cluster_col], errors="coerce")
-    except Exception:
-        return df
-
+    df[cluster_col] = pd.to_numeric(df[cluster_col], errors="coerce")
     labels = sorted(df[cluster_col].dropna().unique().tolist())
     if not labels:
         return df
-
     prof_cols = [c for c in ["value_psf", "sqft", "age"] if c in df.columns]
     if not prof_cols:
         df["Cluster Name"] = df[cluster_col].apply(lambda x: f"Cluster {int(x)}" if pd.notna(x) else "Unknown")
         return df
-
     prof = df.groupby(cluster_col)[prof_cols].median()
-
     name_map = {}
     if len(labels) >= 3 and "value_psf" in prof.columns and "sqft" in prof.columns:
         small_high = prof["value_psf"].idxmax()
         large_lab  = prof["sqft"].idxmax()
         remaining = [l for l in labels if l not in [small_high, large_lab]]
         core_lab = remaining[0] if remaining else None
-
         name_map[small_high] = "Tiny/Special (High $/ft²)"
         name_map[large_lab]  = "Large & Older"
         if core_lab is not None:
             name_map[core_lab] = "Core Buildings"
-
         for l in labels:
             if l not in name_map:
                 name_map[l] = f"Cluster {int(l)}"
     else:
         for l in labels:
             name_map[l] = f"Cluster {int(l)}"
-
     df["Cluster Name"] = df[cluster_col].map(name_map)
     return df
 
-# ---------- ML explainability helpers ----------
-def silhouette_label(s):
-    if s >= 0.65: return "excellent separation"
-    if s >= 0.50: return "good separation"
-    if s >= 0.35: return "moderate separation"
-    if s >= 0.20: return "weak separation"
-    return "poor separation"
+# ------------ Leaflet map builders ------------
+def make_state_bubble_map(flt: pd.DataFrame) -> folium.Map | None:
+    """Aggregates by state and draws proportional circles (meters)."""
+    cols_ok = all(c in flt.columns for c in ["state", "lat", "lon"])
+    if not cols_ok or flt[["lat", "lon"]].dropna().empty:
+        return None
+    g = flt.dropna(subset=["lat", "lon"]).copy()
+    g = g[g["lat"].between(-90,90) & g["lon"].between(-180,180)]
+    agg = (g.groupby("state")
+             .agg(lat=("lat","mean"), lon=("lon","mean"),
+                  total_value=("value","sum"),
+                  n=("state","size"))
+             .reset_index())
+    if agg.empty:
+        return None
+    vmed = max(agg["total_value"].replace(0, np.nan).median(skipna=True) or 1.0, 1.0)
+    m = folium.Map(location=[agg["lat"].mean(), agg["lon"].mean()],
+                   zoom_start=4, tiles="cartodbpositron")
+    for _, r in agg.iterrows():
+        scale = np.sqrt(max(float(r["total_value"]), 1.0) / vmed)
+        radius = float(25000 * scale)  # meters
+        html = (f"<b>{r['state']}</b><br>"
+                f"Assets: {int(r['n']):,}<br>"
+                f"Total value: {fmt_money_units(r['total_value'])}")
+        folium.Circle(
+            location=[r["lat"], r["lon"]],
+            radius=radius, color="#2563eb", weight=2,
+            fill=True, fill_opacity=0.15,
+            popup=folium.Popup(html, max_width=300)
+        ).add_to(m)
+    return m
 
-def quant_bucket(v, qs=(0.33, 0.66), labels=("small","mid","large")):
-    if v is None or np.isnan(v): return "unknown"
-    q1, q2 = qs
-    if v < q1:  return labels[0]
-    if v < q2:  return labels[1]
-    return labels[2]
-
-def describe_cluster_row(row, q_sqft, q_psf, q_age):
-    size_tag   = quant_bucket(row.get("sqft", np.nan),  q_sqft,  ("small","mid","large"))
-    psf_tag    = quant_bucket(row.get("value_psf", np.nan), q_psf, ("low $/ft²","mid $/ft²","high $/ft²"))
-    age_tag    = quant_bucket(row.get("age", np.nan),   q_age,   ("younger","mid-age","older"))
-    return f"{size_tag} assets, {psf_tag}, {age_tag}."
+def make_marker_cluster_map(flt: pd.DataFrame) -> folium.Map | None:
+    """MarkerCluster with compact popups for each asset."""
+    if not all(c in flt.columns for c in ["lat", "lon"]) or flt[["lat","lon"]].dropna().empty:
+        return None
+    g = flt.dropna(subset=["lat","lon"]).copy()
+    g = g[g["lat"].between(-90,90) & g["lon"].between(-180,180)]
+    if g.empty:
+        return None
+    m = folium.Map(location=[g["lat"].mean(), g["lon"].mean()],
+                   zoom_start=4, tiles="cartodbpositron")
+    cluster = MarkerCluster(name="Assets").add_to(m)
+    for _, r in g.iterrows():
+        parts = [
+            f"<b>{str(r.get('asset_name','')).title()}</b>",
+            f"{str(r.get('state',''))} {str(r.get('zip',''))}",
+            f"Type: {str(r.get('asset_type',''))}",
+            f"Value: {fmt_money_units(r.get('value', np.nan))}",
+            f"$ /ft²: {fmt_money_units(r.get('value_psf', np.nan))}",
+            f"Conf: {str(r.get('conf_cat',''))}",
+        ]
+        popup_html = "<br>".join([p for p in parts if p])
+        folium.CircleMarker(
+            location=[r["lat"], r["lon"]],
+            radius=4, fill=True, fill_opacity=0.85,
+            weight=0, color="#1f2937",
+            popup=folium.Popup(popup_html, max_width=300)
+        ).add_to(cluster)
+    folium.LayerControl(collapsed=False).add_to(m)
+    return m
 
 # -------------------- Prepare data --------------------
 df = canonicalize(raw)
@@ -234,7 +249,7 @@ with tab_dash:
     found_path = next((p for p in CANDIDATE_FILES if p.exists()), None)
     st.caption(
         f"Loaded **{len(df):,}** rows from "
-        f"{found_path.as_posix() if found_path else ('DATA_URL' if st.secrets.get('DATA_URL') else 'data source')}"
+        f"{found_path.as_posix() if found_path else 'DATA_URL'}"
     )
 
     # ---------- Filters + Reset ----------
@@ -296,142 +311,108 @@ with tab_dash:
     k3.metric("Median Value", fmt_money_units(flt['value'].median()) if "value" in flt.columns else "—")
     k4.metric("Median $/ft²", fmt_money_units(flt['value_psf'].median()) if "value_psf" in flt.columns else "—")
 
-    # ---------- MAP (above charts) ----------
+    # ---------- MAP (pydeck, above charts) ----------
     st.markdown("### Map")
     if ("lat" not in flt.columns) or ("lon" not in flt.columns) or flt[["lat","lon"]].dropna().empty:
         st.info("No geocoded rows to plot. Check filters or CSV columns.")
     else:
         geo = flt.dropna(subset=["lat","lon"]).copy()
         geo = geo[geo["lat"].between(-90,90) & geo["lon"].between(-180,180)]
-        if geo.empty:
-            st.warning("No rows with valid lat/lon after filters.")
+        if "value" in geo.columns and geo["value"].notna().any():
+            v = geo["value"].astype(float).clip(lower=1)
+            vmed = max(float(v.median()), 1.0)
+            scale = (v / vmed).clip(0.05, 20.0) ** 0.35
+            geo["radius_m"] = (12000 * scale).clip(3000, 40000)
         else:
-            # Visible marker radius (meters) at country zoom
-            if "value" in geo.columns and geo["value"].notna().any():
-                v = geo["value"].astype(float).clip(lower=1)
-                vmed = max(float(v.median()), 1.0)
-                scale = (v / vmed).clip(0.05, 20.0) ** 0.35
-                geo["radius_m"] = (12000 * scale).clip(3000, 40000)  # 3–40 km
+            geo["radius_m"] = 10000
+
+        color_options = []
+        if "Cluster Name" in geo.columns: color_options.append("Cluster Name")
+        elif "cluster" in geo.columns:   color_options.append("Cluster ID")
+        if "conf_cat" in geo.columns:    color_options.append("Confidence")
+        if "asset_type" in geo.columns:  color_options.append("Asset Type")
+        if "state" in geo.columns:       color_options.append("State")
+        color_by = st.selectbox("Color by", color_options or ["State"], index=0)
+        key_series = (
+            geo["Cluster Name"] if color_by == "Cluster Name"
+            else geo["cluster"].astype(str) if color_by == "Cluster ID"
+            else geo["conf_cat"] if color_by == "Confidence"
+            else geo["asset_type"] if color_by == "Asset Type"
+            else geo["state"]
+        )
+        colors, cmap = color_map_for(key_series); geo["color"] = colors
+        legend_html = " ".join([f"<span class='legend-item'><span class='legend-swatch' "
+                                f"style='background: rgb({v[0]},{v[1]},{v[2]});'></span>{k}</span>"
+                                for k, v in cmap.items()])
+        if legend_html: st.markdown(f"**Legend:** {legend_html}", unsafe_allow_html=True)
+
+        center_lat = float(geo["lat"].mean()); center_lon = float(geo["lon"].mean())
+        view = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=4.2 if len(geo)>1000 else 5.2)
+        layer = pdk.Layer("ScatterplotLayer", data=geo, get_position='[lon, lat]',
+                          get_radius='radius_m', radius_min_pixels=2, radius_max_pixels=40,
+                          get_fill_color='color', pickable=True, auto_highlight=True)
+        tooltip = {"html":"<b>{asset_name}</b><br/>${value:,.0f}<br/>{state} {zip}",
+                   "style":{"backgroundColor":"steelblue","color":"white"}}
+        st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view, tooltip=tooltip),
+                        use_container_width=True)
+
+    # ---------- Leaflet maps (new) ----------
+    with st.expander("🌍 Leaflet maps (downloadable HTML)", expanded=False):
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            m1 = make_state_bubble_map(flt)
+            if m1 is None:
+                st.info("Need columns: state, lat, lon and some rows to draw the state bubble map.")
             else:
-                geo["radius_m"] = 10000
-
-            # ---- choose color field (prefer friendly Cluster Name) ----
-            color_options = []
-            if "Cluster Name" in geo.columns: color_options.append("Cluster Name")
-            if "cluster" in geo.columns:      color_options.append("Cluster ID")
-            if "conf_cat" in geo.columns:     color_options.append("Confidence")
-            if "asset_type" in geo.columns:   color_options.append("Asset Type")
-            if "state" in geo.columns:        color_options.append("State")
-            color_by = st.selectbox("Color by", color_options or ["State"], index=0)
-
-            if color_by == "Cluster Name": key_series = geo["Cluster Name"]
-            elif color_by == "Cluster ID": key_series = geo["cluster"].astype(str)
-            elif color_by == "Confidence": key_series = geo["conf_cat"]
-            elif color_by == "Asset Type": key_series = geo["asset_type"]
-            else:                           key_series = geo["state"]
-
-            colors, cmap = color_map_for(key_series)
-            geo["color"] = colors
-
-            # Legend
-            legend_html = " ".join(
-                [f"<span class='legend-item'><span class='legend-swatch' "
-                 f"style='background: rgb({v[0]},{v[1]},{v[2]});'></span>{k}</span>"
-                 for k, v in cmap.items()]
-            )
-            if legend_html:
-                st.markdown(f"**Legend:** {legend_html}", unsafe_allow_html=True)
-
-            center_lat = float(geo["lat"].mean()); center_lon = float(geo["lon"].mean())
-            view = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=3.8 if len(geo)>1000 else 5)
-
-            view_type = st.radio("Map view", ["Points", "Heatmap"], horizontal=True, index=0)
-            if view_type == "Heatmap":
-                layer = pdk.Layer(
-                    "HeatmapLayer",
-                    data=geo,
-                    get_position='[lon, lat]',
-                    get_weight='value' if "value" in geo.columns else None,
-                    radiusPixels=70,
-                )
+                st_folium(m1, height=520, width=None)
+                buf = io.BytesIO(); m1.save(buf, close_file=False)
+                st.download_button("⬇️ Download state summary map", buf.getvalue(),
+                                   "state_summary_map.html", "text/html")
+        with mc2:
+            m2 = make_marker_cluster_map(flt)
+            if m2 is None:
+                st.info("Need lat/lon to draw the marker cluster map.")
             else:
-                layer = pdk.Layer(
-                    "ScatterplotLayer",
-                    data=geo,
-                    get_position='[lon, lat]',
-                    get_radius='radius_m',
-                    radius_min_pixels=2,
-                    radius_max_pixels=40,
-                    get_fill_color='color',
-                    pickable=True, auto_highlight=True,
-                )
+                st_folium(m2, height=520, width=None)
+                buf2 = io.BytesIO(); m2.save(buf2, close_file=False)
+                st.download_button("⬇️ Download assets cluster map", buf2.getvalue(),
+                                   "comprehensive_assets_map.html", "text/html")
 
-            tooltip = {"html":"<b>{asset_name}</b><br/>${value:,.0f}<br/>{state} {zip}",
-                       "style":{"backgroundColor":"steelblue","color":"white"}}
-            st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view, tooltip=tooltip),
-                            use_container_width=True)
+    # ---------- Descriptive analytics (4 charts in a row) ----------
+    st.subheader("Descriptive analytics (react to filters)")
+    g1, g2, g3, g4 = st.columns(4)
 
-    # ---------- DESCRIPTIVE ANALYTICS (4 charts) ----------
-    st.markdown("## Descriptive analytics (react to filters)")
-    cA, cB, cC, cD = st.columns(4)
-
-    # 1) Asset mix by type (share of total value)
-    if {"asset_type", "value"}.issubset(flt.columns) and flt["value"].notna().any():
-        mix = (flt.groupby("asset_type")["value"].sum().sort_values(ascending=False))
-        if len(mix) > 8:
-            top = mix.head(7)
-            other = mix.iloc[7:].sum()
-            mix = pd.concat([top, pd.Series({"Others": other})])
-        mix_df = mix.reset_index().rename(columns={"asset_type": "Asset Type", "value": "Total Value"})
-        fig_mix = px.pie(mix_df, values="Total Value", names="Asset Type",
-                         title="Asset mix by type (share of value)", hole=0.55)
-        fig_mix.update_traces(textposition="inside", texttemplate="%{label}<br>%{percent:.1%}")
-        cA.plotly_chart(fig_mix, use_container_width=True)
-    else:
-        cA.info("No asset-type/value data to summarise.")
-
-    # 2) Value per Sq.Ft distribution
+    # 1) Value per Sq.Ft (always informative)
     if "value_psf" in flt.columns and flt["value_psf"].notna().any():
         fig_psf = px.histogram(
             flt.replace([np.inf, -np.inf], np.nan).dropna(subset=["value_psf"]),
-            x="value_psf", nbins=60, title="Value per Sq.Ft"
+            x="value_psf", nbins=50, title="Value per Sq.Ft"
         )
-        cB.plotly_chart(fig_psf, use_container_width=True)
-    else:
-        cB.info("No $/ft² values to plot.")
+        g2.plotly_chart(fig_psf, use_container_width=True)
 
-    # 3) Value vs Sq.Ft (log–log)
-    if {"sqft", "value"}.issubset(flt.columns) and flt[["sqft", "value"]].notna().any().any():
-        plot_df = flt.dropna(subset=["sqft", "value"]).copy()
-        if len(plot_df) > 5000:
-            plot_df = plot_df.sample(5000, random_state=0)
-        fig_sc = px.scatter(
-            plot_df, x="sqft", y="value",
-            hover_data=[c for c in ["asset_name", "asset_type", "state", "zip"] if c in plot_df.columns],
-            title="Value vs Sq.Ft (log–log)"
-        )
+    # 2) Value vs Sq.Ft (log–log)
+    if all(c in flt.columns for c in ["sqft","value"]):
+        plot_df = flt.sample(n=min(4000, len(flt)), random_state=0)
+        fig_sc = px.scatter(plot_df, x="sqft", y="value", title="Value vs Sq.Ft (log–log)",
+                            hover_data=[c for c in ["asset_name","state","zip"] if c in plot_df.columns])
         if (plot_df["sqft"] > 0).any(): fig_sc.update_xaxes(type="log")
         if (plot_df["value"] > 0).any(): fig_sc.update_yaxes(type="log")
-        cC.plotly_chart(fig_sc, use_container_width=True)
-    else:
-        cC.info("No sqft/value pairs to plot.")
+        g3.plotly_chart(fig_sc, use_container_width=True)
 
-    # 4) Top states (by total value OR median $/ft²)
-    if "state" in flt.columns:
-        if "value" in flt.columns and flt["value"].notna().any():
-            top_states = (flt.groupby("state")["value"].sum()
-                            .sort_values(ascending=False).head(10).reset_index())
-            fig_st = px.bar(top_states, x="state", y="value", title="Top states (by total value)")
-            cD.plotly_chart(fig_st, use_container_width=True)
-        elif "value_psf" in flt.columns and flt["value_psf"].notna().any():
-            top_states = (flt.groupby("state")["value_psf"].median()
-                            .sort_values(ascending=False).head(10).reset_index())
-            fig_st = px.bar(top_states, x="state", y="value_psf", title="Top states (by median $/ft²)")
-            cD.plotly_chart(fig_st, use_container_width=True)
-        else:
-            cD.info("No value/$-per-ft² to rank states.")
-    else:
-        cD.info("No state column in the data.")
+    # 3) Top states (by total value)
+    if "state" in flt.columns and "value" in flt.columns:
+        st_agg = (flt.groupby("state")["value"].sum()
+                    .sort_values(ascending=False).head(10)).reset_index()
+        fig_states = px.bar(st_agg, x="state", y="value", title="Top states (by total value)")
+        g4.plotly_chart(fig_states, use_container_width=True)
+
+    # 4) Mix by Asset Type (share of value) – useful when value histogram is sparse
+    if "asset_type" in flt.columns and "value" in flt.columns:
+        ty = (flt.groupby("asset_type")["value"].sum()
+                .sort_values(ascending=False).head(10)).reset_index()
+        ty["share_%"] = 100 * ty["value"] / ty["value"].sum()
+        fig_mix = px.bar(ty, x="asset_type", y="share_%", title="Asset-type mix (share of total value)")
+        g1.plotly_chart(fig_mix, use_container_width=True)
 
     # ---------- Table + Download ----------
     st.markdown("### Top 50 by Value")
@@ -450,28 +431,20 @@ with tab_ml:
     st.info(
         "**How to read Task 3**  \n"
         "1) Choose **k** — we group similar assets.  \n"
-        "2) **Silhouette** ≥ 0.50 is usually good separation.  \n"
-        "3) Profile cards + sizes tell what each cluster represents.  \n"
-        "4) PCA is just a 2D picture for intuition.  \n"
-        "5) RandomForest predicts cluster for new assets."
+        "2) **Silhouette** shows separation (≥0.50 is good).  \n"
+        "3) See cluster sizes, one-line profiles, compositions, PCA.  \n"
+        "4) A **RandomForest** predicts cluster; we show accuracy + confusion matrix."
     )
 
-    must = ["value", "sqft"]
+    must = ["value","sqft","value_psf"]
     if not all(c in df.columns for c in must):
-        st.warning("CSV must include at least: value, sqft. ($/ft² is computed automatically if missing.)")
+        st.warning("CSV must include: value, sqft, value_psf (auto-generated if value & sqft exist).")
         st.stop()
 
-    # Features
-    work = df.copy()
-    if "value_psf" not in work.columns:
-        work["value_psf"] = work["value"] / work["sqft"]
-        work["value_psf"] = work["value_psf"].replace([np.inf, -np.inf], np.nan)
+    ml = df[["value","sqft","value_psf"] + (["age"] if "age" in df.columns else [])].copy()
+    ml = ml.replace([np.inf,-np.inf], np.nan).fillna(ml.median(numeric_only=True))
 
-    ml = work[["value", "sqft", "value_psf"] + (["age"] if "age" in work.columns else [])].copy()
-    ml = ml.replace([np.inf, -np.inf], np.nan)
-    ml = ml.fillna(ml.median(numeric_only=True))
-
-    for c in ["value", "sqft", "value_psf"]:
+    for c in ["value","sqft","value_psf"]:
         ml[f"log_{c}"] = np.log(np.clip(ml[c], 1, None))
 
     X_cols = [c for c in ml.columns if c.startswith("log_")]
@@ -485,25 +458,19 @@ with tab_ml:
     labels = km.fit_predict(X)
     sil = silhouette_score(X, labels)
 
-    df_ml = work.copy()
+    df_ml = df.copy()
     df_ml["cluster"] = labels
-    df_ml = assign_cluster_names_from_profile(df_ml, "cluster")  # friendly names
+    df_ml = assign_cluster_names_from_profile(df_ml, "cluster")
 
-    sizes = df_ml["cluster"].value_counts().sort_index().rename("count")
+    sizes_named = df_ml["Cluster Name"].value_counts().reset_index()
+    sizes_named.columns = ["Cluster Name", "count"]
 
-    prof_cols = [c for c in ["value", "sqft", "value_psf", "age"] if c in df_ml.columns]
-    profile = df_ml.groupby("Cluster Name")[prof_cols].median().sort_index()
-
-    # ----- KPIs -----
     st.markdown("### ML KPIs")
     c1, c2, c3 = st.columns(3)
     c1.metric("Clusters (k)", f"{k}")
     c2.metric("Silhouette", f"{sil:0.3f}")
-    c3.metric("Interpretation", silhouette_label(sil))
+    c3.metric("Interpretation", "excellent" if sil>=0.65 else "good" if sil>=0.5 else "moderate" if sil>=0.35 else "weak")
 
-    # ----- Cluster size chart -----
-    sizes_named = df_ml["Cluster Name"].value_counts().reset_index()
-    sizes_named.columns = ["Cluster Name", "count"]
     fig_sizes = px.bar(
         sizes_named.sort_values("count", ascending=False),
         x="Cluster Name", y="count", color="Cluster Name",
@@ -512,12 +479,9 @@ with tab_ml:
     fig_sizes.update_traces(textposition="outside")
     st.plotly_chart(fig_sizes, use_container_width=True)
 
-    # ----- Cluster profile one-liners -----
-    st.markdown("### Cluster profile (one sentence each)")
-    q_sqft = profile["sqft"].quantile([0.33, 0.66]).values if "sqft" in profile.columns else (0, 0)
-    q_psf  = profile["value_psf"].quantile([0.33, 0.66]).values if "value_psf" in profile.columns else (0, 0)
-    q_age  = profile["age"].quantile([0.33, 0.66]).values if "age" in profile.columns else (0, 0)
-
+    # Cluster profiles (medians)
+    prof_cols = [c for c in ["value","sqft","value_psf","age"] if c in df_ml.columns]
+    profile = df_ml.groupby("Cluster Name")[prof_cols].median().sort_index()
     cards_per_row = 3
     names = profile.index.tolist()
     for i in range(0, len(names), cards_per_row):
@@ -525,21 +489,19 @@ with tab_ml:
         for j, name in enumerate(names[i:i+cards_per_row]):
             with cols[j]:
                 row = profile.loc[name]
-                line = describe_cluster_row(row, q_sqft, q_psf, q_age)
                 st.markdown(
                     f"**{name}**  \n"
                     f"- Median Value: {fmt_money_units(row.get('value', np.nan))}  \n"
                     f"- Median Size: {row.get('sqft', np.nan):,.0f} ft²  \n"
                     f"- Median $/ft²: {fmt_money_units(row.get('value_psf', np.nan))}  \n"
-                    + (f"- Median Age: {row.get('age', np.nan):,.0f} yrs  \n" if 'age' in profile.columns else "")
-                    + f"**Summary:** {line}"
+                    f"- Median Age: {row.get('age', np.nan):,.0f} yrs"
                 )
 
-    # ----- Composition by State / Asset Type -----
-    st.markdown("### Where clusters occur (composition)")
+    # Composition by State / Asset Type
     left, right = st.columns(2)
     if "state" in df_ml.columns:
-        comp_state = (df_ml.groupby(["Cluster Name","state"]).size().reset_index(name="n"))
+        comp_state = (df_ml.groupby(["Cluster Name","state"]).size()
+                        .reset_index(name="n"))
         top_states = (df_ml["state"].value_counts().head(12).index.tolist())
         comp_state = comp_state[comp_state["state"].isin(top_states)]
         with left:
@@ -550,7 +512,8 @@ with tab_ml:
             st.plotly_chart(fig_st, use_container_width=True)
 
     if "asset_type" in df_ml.columns:
-        comp_type = (df_ml.groupby(["Cluster Name","asset_type"]).size().reset_index(name="n"))
+        comp_type = (df_ml.groupby(["Cluster Name","asset_type"]).size()
+                        .reset_index(name="n"))
         top_types = df_ml["asset_type"].value_counts().head(10).index.tolist()
         comp_type = comp_type[comp_type["asset_type"].isin(top_types)]
         with right:
@@ -560,7 +523,7 @@ with tab_ml:
             )
             st.plotly_chart(fig_ty, use_container_width=True)
 
-    # ----- PCA plot -----
+    # PCA
     pca = PCA(n_components=2, random_state=42)
     X2 = pca.fit_transform(X)
     figp = px.scatter(
@@ -570,16 +533,7 @@ with tab_ml:
     )
     st.plotly_chart(figp, use_container_width=True)
 
-    # Download data with clusters
-    st.download_button("⬇️ Download data with clusters (named)",
-                       data=df_ml.to_csv(index=False),
-                       file_name="t3_assets_with_clusters_named.csv",
-                       mime="text/csv")
-
-    # ----- RandomForest classifier -----
-    st.markdown("---")
-    st.subheader("RandomForest: predict cluster")
-
+    # RandomForest classifier
     X_train, X_test, y_train, y_test = train_test_split(
         X, labels, test_size=0.30, random_state=42, stratify=labels
     )
@@ -590,7 +544,6 @@ with tab_ml:
     acc = (y_pred == y_test).mean()
     st.metric("Accuracy", f"{acc:.3f}")
 
-    # Confusion matrix heatmap
     cm = confusion_matrix(y_test, y_pred)
     name_lookup = df_ml.groupby("cluster")["Cluster Name"].agg(
         lambda s: s.mode().iat[0] if not s.mode().empty else f"Cluster {int(s.iloc[0])}"
@@ -611,5 +564,4 @@ with tab_ml:
     imp = pd.Series(rf.feature_importances_, index=X_cols).sort_values(ascending=False)
     fig_imp = px.bar(imp, title="Feature Importances", labels={"index":"feature","value":"importance"})
     st.plotly_chart(fig_imp, use_container_width=True)
-
-st.caption("KPIs in Bn/Mn • Map above charts • 4 reactive descriptive visuals • Task-3 includes cluster naming, sizes, composition, PCA, RF accuracy & feature importances. Use /data/*.csv[.gz] or st.secrets['DATA_URL'].")
+st.caption("KPIs in Bn/Mn. Map above charts. Leaflet maps include a downloadable state bubble map and a cluster map. Task-3 covers clusters + RandomForest."
